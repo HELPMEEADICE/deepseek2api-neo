@@ -1,2 +1,4 @@
 *.bak
 config.json
+CLAUDE.md
+__pycache__

@@ -12,8 +12,7 @@ import transformers
 from curl_cffi import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.templating import Jinja2Templates
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from wasmtime import Linker, Module, Store
 
 # -------------------------- 初始化 tokenizer --------------------------
@@ -39,9 +38,6 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-# 模板目录
-templates = Jinja2Templates(directory="templates")
-
 # ----------------------------------------------------------------------
 # (1) 配置文件的读写函数
 # ----------------------------------------------------------------------
@@ -59,10 +55,18 @@ def load_config():
 
 
 def save_config(cfg):
-    """将配置写回 config.json"""
+    """将配置写回 config.json（移除不可序列化的 _session 字段）"""
     try:
+        # 深拷贝配置，跳过不可序列化的字段
+        def clean(obj):
+            if isinstance(obj, dict):
+                return {k: clean(v) for k, v in obj.items() if not k.startswith("_")}
+            elif isinstance(obj, list):
+                return [clean(item) for item in obj]
+            return obj
+        cfg_clean = clean(cfg)
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+            json.dump(cfg_clean, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"[save_config] 写入 config.json 失败: {e}")
 
@@ -100,16 +104,26 @@ DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_chall
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
 DEEPSEEK_STOP_STREAM_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/stop_stream"
 DEEPSEEK_DELETE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/delete"
+HIF_DLIQ_URL = "https://hif-dliq.deepseek.com/query"
+HIF_LEIM_URL = "https://hif-leim.deepseek.com/query"
 BASE_HEADERS = {
-    "Host": "chat.deepseek.com",
-    "User-Agent": "DeepSeek/1.0.13 Android/35",
-    "Accept": "application/json",
-    "Accept-Encoding": "gzip",
-    "Content-Type": "application/json",
-    "x-client-platform": "android",
-    "x-client-version": "1.3.0-auto-resume",
+    "accept": "*/*",
+    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "cache-control": "no-cache",
+    "content-type": "application/json",
+    "pragma": "no-cache",
+    "sec-ch-ua": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "x-app-version": "20241129.1",
     "x-client-locale": "zh_CN",
-    "accept-charset": "UTF-8",
+    "x-client-platform": "web",
+    "x-client-timezone-offset": "28800",
+    "x-client-version": "1.8.0",
 }
 
 # ----------------------------------------------------------------------
@@ -135,6 +149,7 @@ def get_account_identifier(account):
 def login_deepseek_via_account(account):
     """使用 account 中的 email 或 mobile 登录 DeepSeek，
     成功后将返回的 token 写入 account 并保存至配置文件，返回新 token。
+    同时初始化 Session 并获取 HIF 令牌。
     """
     email = account.get("email", "").strip()
     mobile = account.get("mobile", "").strip()
@@ -144,6 +159,10 @@ def login_deepseek_via_account(account):
             status_code=400,
             detail="账号缺少必要的登录信息（必须提供 email 或 mobile 以及 password）",
         )
+
+    # 初始化 Session（先访问主页初始化 Cookie）
+    session = get_account_session(account)
+
     if email:
         payload = {
             "email": email,
@@ -160,7 +179,7 @@ def login_deepseek_via_account(account):
             "os": "android",
         }
     try:
-        resp = requests.post(DEEPSEEK_LOGIN_URL, headers=BASE_HEADERS, json=payload, impersonate="safari15_3")
+        resp = session.post(DEEPSEEK_LOGIN_URL, headers=BASE_HEADERS, json=payload, impersonate="safari15_3")
         resp.raise_for_status()
     except Exception as e:
         logger.error(f"[login_deepseek_via_account] 登录请求异常: {e}")
@@ -191,6 +210,10 @@ def login_deepseek_via_account(account):
         )
     account["token"] = new_token
     save_config(CONFIG)
+
+    # 登录成功后获取 HIF 令牌
+    ensure_hif_tokens(account, force=True)
+
     return new_token
 
 
@@ -263,7 +286,8 @@ def determine_mode_and_token(request: Request):
                 status_code=429,
                 detail="No accounts configured or all accounts are busy.",
             )
-        if not selected_account.get("token", "").strip():
+        need_login = not selected_account.get("token", "").strip()
+        if need_login:
             try:
                 login_deepseek_via_account(selected_account)
             except Exception as e:
@@ -271,6 +295,9 @@ def determine_mode_and_token(request: Request):
                     f"[determine_mode_and_token] 账号 {get_account_identifier(selected_account)} 登录失败：{e}"
                 )
                 raise HTTPException(status_code=500, detail="Account login failed.")
+        else:
+            # 已有 token 但可能缺少 HIF 令牌，确保获取
+            ensure_hif_tokens(selected_account)
 
         request.state.deepseek_token = selected_account.get("token")
         request.state.account = selected_account
@@ -283,6 +310,129 @@ def determine_mode_and_token(request: Request):
 def get_auth_headers(request: Request):
     """返回 DeepSeek 请求所需的公共请求头"""
     return {**BASE_HEADERS, "authorization": f"Bearer {request.state.deepseek_token}"}
+
+
+def get_hif_headers(request: Request):
+    """返回 HIF (x-hif-dliq / x-hif-leim) 认证头"""
+    headers = {}
+    account = getattr(request.state, "account", None)
+    if account:
+        if account.get("hif_dliq"):
+            headers["x-hif-dliq"] = account["hif_dliq"]
+        if account.get("hif_leim"):
+            headers["x-hif-leim"] = account["hif_leim"]
+    return headers
+
+
+# ----------------------------------------------------------------------
+# Session 管理：每个账号或 token 模式使用独立的 curl_cffi Session 维护 Cookie
+# ----------------------------------------------------------------------
+_token_session = None  # token 模式下的全局 session
+
+
+def init_account_session(account):
+    """为账号初始化 curl_cffi Session，先访问主页初始化 Cookie"""
+    session = requests.Session()
+    try:
+        resp = session.get(
+            "https://chat.deepseek.com/",
+            headers={k: v for k, v in BASE_HEADERS.items() if k != "content-type"},
+            impersonate="safari15_3",
+            timeout=15,
+        )
+        logger.info(
+            f"[init_account_session] 账号 {get_account_identifier(account)} 主页初始化完成, status={resp.status_code}"
+        )
+        resp.close()
+    except Exception as e:
+        logger.warning(f"[init_account_session] 主页初始化失败: {e}")
+    account["_session"] = session
+    return session
+
+
+def get_account_session(account):
+    """获取账号关联的 Session，不存在则创建"""
+    session = account.get("_session")
+    if session is None:
+        session = init_account_session(account)
+    return session
+
+
+def get_request_session(request: Request):
+    """从 request.state 获取 Session（配置模式取 account 的，token 模式用全局）"""
+    if getattr(request.state, "use_config_token", False):
+        account = getattr(request.state, "account", None)
+        if account:
+            return get_account_session(account)
+    # token 模式 — 全局单例
+    global _token_session
+    if _token_session is None:
+        _token_session = requests.Session()
+        try:
+            resp = _token_session.get(
+                "https://chat.deepseek.com/",
+                headers={k: v for k, v in BASE_HEADERS.items() if k != "content-type"},
+                impersonate="safari15_3",
+                timeout=15,
+            )
+            resp.close()
+        except Exception as e:
+            logger.warning(f"[get_request_session] 全局 session 主页初始化失败: {e}")
+    return _token_session
+
+
+def fetch_hif_token(session, url, token_name):
+    """从 HIF 端点获取令牌，返回 token 字符串或 None"""
+    try:
+        resp = session.get(
+            url,
+            headers=BASE_HEADERS,
+            impersonate="safari15_3",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("code") == 0:
+                value = data.get("data", {}).get("biz_data", {}).get("value")
+                if value:
+                    logger.info(f"[fetch_hif_token] 成功获取 {token_name}")
+                    return value
+                else:
+                    logger.warning(f"[fetch_hif_token] {token_name} 响应中缺少 value: {data}")
+            else:
+                logger.warning(f"[fetch_hif_token] {token_name} 业务错误 code={data.get('code')}")
+        else:
+            logger.warning(f"[fetch_hif_token] {token_name} HTTP {resp.status_code}")
+        resp.close()
+    except Exception as e:
+        logger.error(f"[fetch_hif_token] {token_name} 异常: {e}")
+    return None
+
+
+def ensure_hif_tokens(account, force=False):
+    """确保账号有 HIF 令牌，缺失（或强制）时从 HIF 端点重新获取"""
+    if not force and account.get("hif_dliq") and account.get("hif_leim"):
+        return True
+
+    session = get_account_session(account)
+
+    logger.info(f"[ensure_hif_tokens] 账号 {get_account_identifier(account)} 开始获取 HIF 令牌")
+    dliq = fetch_hif_token(session, HIF_DLIQ_URL, "x-hif-dliq")
+    leim = fetch_hif_token(session, HIF_LEIM_URL, "x-hif-leim")
+
+    if dliq:
+        account["hif_dliq"] = dliq
+    if leim:
+        account["hif_leim"] = leim
+    if dliq or leim:
+        save_config(CONFIG)
+
+    if dliq and leim:
+        logger.info(f"[ensure_hif_tokens] 账号 {get_account_identifier(account)} HIF 令牌已就绪")
+        return True
+    else:
+        logger.warning(f"[ensure_hif_tokens] 账号 {get_account_identifier(account)} HIF 令牌不完整")
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -306,8 +456,8 @@ def convert_claude_to_deepseek(claude_request):
     
     # 从配置文件读取Claude模型映射
     claude_mapping = CONFIG.get("claude_model_mapping", {
-        "fast": "deepseek-chat",
-        "slow": "deepseek-chat"
+        "fast": "deepseek-v4-flash",
+        "slow": "deepseek-v4-flash"
     })
     
     # Claude模型映射到DeepSeek模型 - 基于配置和模型特征判断
@@ -381,41 +531,46 @@ async def call_claude_via_openai(request: Request, claude_payload):
         # 准备DeepSeek API调用
         model = deepseek_payload.get("model", "deepseek-chat")
         messages = deepseek_payload.get("messages", [])
-        
-        # 判断模型特性
+
+        # 判断模型类型
         model_lower = model.lower()
-        if model_lower in ["deepseek-v3", "deepseek-chat"]:
-            thinking_enabled = False
-            search_enabled = False
-        elif model_lower in ["deepseek-r1", "deepseek-reasoner"]:
-            thinking_enabled = True
-            search_enabled = False
-        elif model_lower in ["deepseek-v3-search", "deepseek-chat-search"]:
-            thinking_enabled = False
-            search_enabled = True
-        elif model_lower in ["deepseek-r1-search", "deepseek-reasoner-search"]:
-            thinking_enabled = True
-            search_enabled = True
+        if model_lower in ["deepseek-v4-flash", "deepseek-chat", "deepseek-v3"]:
+            model_type = "default"
+            auto_thinking = False
+        elif model_lower in ["deepseek-reasoner", "deepseek-r1"]:
+            model_type = "default"
+            auto_thinking = True
+        elif model_lower in ["deepseek-v4-pro"]:
+            model_type = "expert"
+            auto_thinking = False
         else:
-            thinking_enabled = False
-            search_enabled = False
-        
+            model_type = "default"
+            auto_thinking = False
+
+        # thinking_enabled 和 search_enabled 从请求中获取
+        thinking_enabled = deepseek_payload.get("thinking_enabled", auto_thinking)
+        if not isinstance(thinking_enabled, bool):
+            thinking_enabled = auto_thinking
+        search_enabled = bool(deepseek_payload.get("search_enabled", False))
+
         # 使用 messages_prepare 函数构造最终 prompt
         final_prompt = messages_prepare(messages)
-        
-        headers = {**get_auth_headers(request), "x-ds-pow-response": pow_resp}
+
+        headers = {**get_auth_headers(request), **get_hif_headers(request), "x-ds-pow-response": pow_resp}
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
+            "model_type": model_type,
             "prompt": final_prompt,
             "ref_file_ids": [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
+            "preempt": False,
         }
 
-        deepseek_resp = call_completion_endpoint(payload, headers, max_attempts=3)
+        deepseek_resp = call_completion_endpoint(payload, headers, get_request_session(request), max_attempts=3)
         return deepseek_resp
-        
+
     except Exception as e:
         logger.error(f"[call_claude_via_openai] 调用失败: {e}")
         return None
@@ -424,11 +579,11 @@ async def call_claude_via_openai(request: Request, claude_payload):
 # ----------------------------------------------------------------------
 # (6) 封装对话接口调用的重试机制
 # ----------------------------------------------------------------------
-def call_completion_endpoint(payload, headers, max_attempts=3):
+def call_completion_endpoint(payload, headers, session, max_attempts=3):
     attempts = 0
     while attempts < max_attempts:
         try:
-            deepseek_resp = requests.post(
+            deepseek_resp = session.post(
                 DEEPSEEK_COMPLETION_URL, headers=headers, json=payload, stream=True, impersonate="safari15_3"
             )
         except Exception as e:
@@ -455,9 +610,10 @@ def create_session(request: Request, max_attempts=3):
     attempts = 0
     while attempts < max_attempts:
         headers = get_auth_headers(request)
+        ds_session = get_request_session(request)
         try:
-            resp = requests.post(
-                DEEPSEEK_CREATE_SESSION_URL, headers=headers, json={"agent": "chat"}, impersonate="safari15_3"
+            resp = ds_session.post(
+                DEEPSEEK_CREATE_SESSION_URL, headers=headers, json={}, impersonate="safari15_3"
             )
         except Exception as e:
             logger.error(f"[create_session] 请求异常: {e}")
@@ -471,7 +627,12 @@ def create_session(request: Request, max_attempts=3):
             logger.error(f"[create_session] JSON解析异常: {e}")
             data = {}
         if resp.status_code == 200 and data.get("code") == 0:
-            session_id = data["data"]["biz_data"]["id"]
+            biz_data = data["data"]["biz_data"]
+            # 新响应格式：biz_data.chat_session.id；旧格式：biz_data.id
+            if "chat_session" in biz_data:
+                session_id = biz_data["chat_session"]["id"]
+            else:
+                session_id = biz_data["id"]
 
             resp.close()
             return session_id
@@ -607,8 +768,9 @@ def get_pow_response(request: Request, max_attempts=3):
     attempts = 0
     while attempts < max_attempts:
         headers = get_auth_headers(request)
+        ds_session = get_request_session(request)
         try:
-            resp = requests.post(
+            resp = ds_session.post(
                 DEEPSEEK_CREATE_POW_URL,
                 headers=headers,
                 json={"target_path": "/api/v0/chat/completion"},
@@ -698,7 +860,7 @@ def get_pow_response(request: Request, max_attempts=3):
 def list_models():
     models_list = [
         {
-            "id": "deepseek-chat",
+            "id": "deepseek-v4-flash",
             "object": "model",
             "created": 1677610602,
             "owned_by": "deepseek",
@@ -712,14 +874,14 @@ def list_models():
             "permission": [],
         },
         {
-            "id": "deepseek-chat-search",
+            "id": "deepseek-v4-pro",
             "object": "model",
             "created": 1677610602,
             "owned_by": "deepseek",
             "permission": [],
         },
         {
-            "id": "deepseek-reasoner-search",
+            "id": "deepseek-chat",
             "object": "model",
             "created": 1677610602,
             "owned_by": "deepseek",
@@ -902,24 +1064,26 @@ async def chat_completions(request: Request):
             raise HTTPException(
                 status_code=400, detail="Request must include 'model' and 'messages'."
             )
-        # 判断是否启用"思考"或"搜索"功能（这里根据模型名称判断）
+        # 判断模型类型
         model_lower = model.lower()
-        if model_lower in ["deepseek-v3", "deepseek-chat"]:
-            thinking_enabled = False
-            search_enabled = False
-        elif model_lower in ["deepseek-r1", "deepseek-reasoner"]:
-            thinking_enabled = True
-            search_enabled = False
-        elif model_lower in ["deepseek-v3-search", "deepseek-chat-search"]:
-            thinking_enabled = False
-            search_enabled = True
-        elif model_lower in ["deepseek-r1-search", "deepseek-reasoner-search"]:
-            thinking_enabled = True
-            search_enabled = True
+        if model_lower in ["deepseek-v4-flash", "deepseek-chat", "deepseek-v3"]:
+            model_type = "default"
+            auto_thinking = False
+        elif model_lower in ["deepseek-reasoner", "deepseek-r1"]:
+            model_type = "default"
+            auto_thinking = True
+        elif model_lower in ["deepseek-v4-pro"]:
+            model_type = "expert"
+            auto_thinking = False
         else:
             raise HTTPException(
                 status_code=503, detail=f"Model '{model}' is not available."
             )
+        # thinking_enabled 默认由模型决定，请求参数可覆盖
+        thinking_enabled = req_data.get("thinking_enabled", auto_thinking)
+        if not isinstance(thinking_enabled, bool):
+            thinking_enabled = auto_thinking
+        search_enabled = bool(req_data.get("search_enabled", False))
         
         # 处理 tools 参数（OpenAI 格式）
         tools_requested = req_data.get("tools") or []
@@ -984,17 +1148,19 @@ After calling tools, you will receive the results and can continue the conversat
                 status_code=401,
                 detail="Failed to get PoW (invalid token or unknown error).",
             )
-        headers = {**get_auth_headers(request), "x-ds-pow-response": pow_resp}
+        headers = {**get_auth_headers(request), **get_hif_headers(request), "x-ds-pow-response": pow_resp}
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
+            "model_type": model_type,
             "prompt": final_prompt,
             "ref_file_ids": [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
+            "preempt": False,
         }
 
-        deepseek_resp = call_completion_endpoint(payload, headers, max_attempts=3)
+        deepseek_resp = call_completion_endpoint(payload, headers, get_request_session(request), max_attempts=3)
         if not deepseek_resp:
             raise HTTPException(status_code=500, detail="Failed to get completion.")
         created_time = int(time.time())
@@ -1026,7 +1192,8 @@ After calling tools, you will receive the results and can continue the conversat
                             payload = {
                                 "chat_session_id": session_id
                             }
-                            resp = requests.post(
+                            ds_session = get_request_session(request)
+                            resp = ds_session.post(
                                 DEEPSEEK_DELETE_SESSION_URL,
                                 headers=headers,
                                 json=payload,
@@ -1041,21 +1208,19 @@ After calling tools, you will receive the results and can continue the conversat
                             logger.warning(f"[sse_stream] 调用 delete_session 失败: {e}")
 
                     def process_data():
-                        ptype = "text"
+                        current_ptype = "text"
                         try:
                             for raw_line in deepseek_resp.iter_lines():
                                 try:
                                     line = raw_line.decode("utf-8")
                                 except Exception as e:
                                     logger.warning(f"[sse_stream] 解码失败: {e}")
-                                    # 根据当前模式决定错误消息类型
-                                    error_type = "thinking" if ptype == "thinking" else "text"
+                                    error_type = "thinking" if current_ptype == "thinking" else "text"
                                     busy_content_str = f'{{"choices":[{{"index":0,"delta":{{"content":"解码失败，请稍候再试","type":"{error_type}"}}}}],"model":"","chunk_token_usage":1,"created":0,"message_id":-1,"parent_id":-1}}'
                                     try:
                                         busy_content = json.loads(busy_content_str)
                                         result_queue.put(busy_content)
                                     except json.JSONDecodeError:
-                                        # 如果JSON解析也失败，创建最基本的错误响应
                                         result_queue.put({"choices": [{"index": 0, "delta": {"content": "解码失败", "type": "text"}}]})
                                     result_queue.put(None)
                                     break
@@ -1068,72 +1233,91 @@ After calling tools, you will receive the results and can continue the conversat
                                         break
                                     try:
                                         chunk = json.loads(data_str)
-                                        
-                                        if "response_message_id" in chunk:
-                                            response_message_id = chunk["response_message_id"]
-                                        
+
+                                        # ---- 新格式：初始片段状态（v.response.fragments） ----
+                                        if "v" in chunk and isinstance(chunk["v"], dict) and "response" in chunk["v"]:
+                                            fragments = chunk["v"]["response"].get("fragments", [])
+                                            if fragments and isinstance(fragments, list) and len(fragments) > 0:
+                                                frag_type = fragments[0].get("type", "")
+                                                current_ptype = "thinking" if frag_type == "THINK" else "text"
+                                                # 处理片段中的初始内容
+                                                frag_content = fragments[0].get("content", "")
+                                                if frag_content:
+                                                    unified_chunk = {
+                                                        "choices": [{"index": 0, "delta": {"content": frag_content, "type": current_ptype}}],
+                                                        "model": "", "chunk_token_usage": len(frag_content) // 4,
+                                                        "created": 0, "message_id": -1, "parent_id": -1,
+                                                    }
+                                                    result_queue.put(unified_chunk)
+                                            continue
+
+                                        # ---- 新格式：fragment 追加（THINK→RESPONSE 切换） ----
+                                        if "p" in chunk and chunk.get("p") == "response/fragments" and chunk.get("o") == "APPEND":
+                                            new_frags = chunk.get("v", [])
+                                            if new_frags and isinstance(new_frags, list) and len(new_frags) > 0:
+                                                frag_type = new_frags[0].get("type", "")
+                                                current_ptype = "thinking" if frag_type == "THINK" else "text"
+                                                frag_content = new_frags[0].get("content", "")
+                                                if frag_content:
+                                                    unified_chunk = {
+                                                        "choices": [{"index": 0, "delta": {"content": frag_content, "type": current_ptype}}],
+                                                        "model": "", "chunk_token_usage": len(frag_content) // 4,
+                                                        "created": 0, "message_id": -1, "parent_id": -1,
+                                                    }
+                                                    result_queue.put(unified_chunk)
+                                            continue
+
+                                        # ---- 兼容旧格式：thinking_content / content 切换 ----
+                                        if "p" in chunk and chunk.get("p") == "response/thinking_content":
+                                            current_ptype = "thinking"
+                                        elif "p" in chunk and chunk.get("p") == "response/content":
+                                            current_ptype = "text"
+
+                                        # ---- status / search_status ----
+                                        if "p" in chunk and chunk.get("p") == "response/status":
+                                            if chunk.get("v") == 'FINISHED':
+                                                result_queue.put(None)
+                                                break
+                                            continue
+                                        if "p" in chunk and chunk.get("p") == "response/search_status":
+                                            continue
+
+                                        # ---- 处理 v 字段 ----
                                         if "v" in chunk:
                                             v_value = chunk["v"]
-                                            
-                                            # 构造新的 delta 格式的 chunk
-                                            content = ""
 
-                                            if "p" in chunk and chunk.get("p") == "response/status":
-                                                if v_value=='FINISHED':
-                                                    result_queue.put(None)  # 结束信号
-                                                    break
-                                                continue
-                                            
-                                            if "p" in chunk and chunk.get("p") == "response/search_status":
-                                                continue
-                                                
-                                            if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                                ptype = "thinking"
-                                            elif "p" in chunk and chunk.get("p") == "response/content":
-                                                ptype = "text"
-
-                                            # 处理文本内容
                                             if isinstance(v_value, str):
                                                 content = v_value
-                                            # 处理数组更新如状态变更
                                             elif isinstance(v_value, list):
                                                 for item in v_value:
                                                     if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                        # 最终完成信号
                                                         result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
                                                         result_queue.put(None)
                                                         return
                                                 continue
-                                            
-                                            # 构造兼容原逻辑的 chunk
+                                            else:
+                                                continue
+
                                             unified_chunk = {
                                                 "choices": [{
                                                     "index": 0,
-                                                    "delta": {
-                                                        "content": content,
-                                                        "type": ptype
-                                                    }
+                                                    "delta": {"content": content, "type": current_ptype}
                                                 }],
                                                 "model": "",
-                                                "chunk_token_usage": len(content) // 4,  # 简单估算token数
+                                                "chunk_token_usage": len(content) // 4,
                                                 "created": 0,
                                                 "message_id": -1,
-                                                "parent_id": -1
+                                                "parent_id": -1,
                                             }
-                    
                                             result_queue.put(unified_chunk)
                                     except Exception as e:
-                                        logger.warning(
-                                            f"[sse_stream] 无法解析: {data_str}, 错误: {e}"
-                                        )
-                                        # 根据当前模式决定错误消息类型
-                                        error_type = "thinking" if ptype == "thinking" else "text"
+                                        logger.warning(f"[sse_stream] 无法解析: {data_str}, 错误: {e}")
+                                        error_type = "thinking" if current_ptype == "thinking" else "text"
                                         busy_content_str = f'{{"choices":[{{"index":0,"delta":{{"content":"解析失败，请稍候再试","type":"{error_type}"}}}}],"model":"","chunk_token_usage":1,"created":0,"message_id":-1,"parent_id":-1}}'
                                         try:
                                             busy_content = json.loads(busy_content_str)
                                             result_queue.put(busy_content)
                                         except json.JSONDecodeError:
-                                            # 如果JSON解析也失败，创建最基本的错误响应
                                             result_queue.put({"choices": [{"index": 0, "delta": {"content": "解析失败", "type": "text"}}]})
                                         result_queue.put(None)
                                         break
@@ -1314,7 +1498,8 @@ After calling tools, you will receive the results and can continue the conversat
                     payload = {
                         "chat_session_id": session_id
                     }
-                    resp = requests.post(
+                    ds_session = get_request_session(request)
+                    resp = ds_session.post(
                         DEEPSEEK_DELETE_SESSION_URL,
                         headers=headers,
                         json=payload,
@@ -1330,15 +1515,14 @@ After calling tools, you will receive the results and can continue the conversat
 
             def collect_data():
                 nonlocal result
-                ptype = "text"
+                current_ptype = "text"
                 try:
                     for raw_line in deepseek_resp.iter_lines():
                         try:
                             line = raw_line.decode("utf-8")
                         except Exception as e:
                             logger.warning(f"[chat_completions] 解码失败: {e}")
-                            # 根据当前处理类型添加错误消息
-                            if ptype == "thinking":
+                            if current_ptype == "thinking":
                                 think_list.append('解码失败，请稍候再试')
                             else:
                                 text_list.append('解码失败，请稍候再试')
@@ -1353,35 +1537,62 @@ After calling tools, you will receive the results and can continue the conversat
                                 break
                             try:
                                 chunk = json.loads(data_str)
-            
-                                # 提取 v 字段
+
+                                # ---- 新格式：初始片段状态（v.response.fragments） ----
+                                if "v" in chunk and isinstance(chunk["v"], dict) and "response" in chunk["v"]:
+                                    fragments = chunk["v"]["response"].get("fragments", [])
+                                    if fragments and isinstance(fragments, list) and len(fragments) > 0:
+                                        frag_type = fragments[0].get("type", "")
+                                        current_ptype = "thinking" if frag_type == "THINK" else "text"
+                                        frag_content = fragments[0].get("content", "")
+                                        if frag_content:
+                                            if current_ptype == "thinking":
+                                                think_list.append(frag_content)
+                                            else:
+                                                text_list.append(frag_content)
+                                    continue
+
+                                # ---- 新格式：fragment 追加（THINK→RESPONSE 切换） ----
+                                if "p" in chunk and chunk.get("p") == "response/fragments" and chunk.get("o") == "APPEND":
+                                    new_frags = chunk.get("v", [])
+                                    if new_frags and isinstance(new_frags, list) and len(new_frags) > 0:
+                                        frag_type = new_frags[0].get("type", "")
+                                        current_ptype = "thinking" if frag_type == "THINK" else "text"
+                                        frag_content = new_frags[0].get("content", "")
+                                        if frag_content:
+                                            if current_ptype == "thinking":
+                                                think_list.append(frag_content)
+                                            else:
+                                                text_list.append(frag_content)
+                                    continue
+
+                                # ---- 兼容旧格式：thinking_content / content 切换 ----
+                                if "p" in chunk and chunk.get("p") == "response/thinking_content":
+                                    current_ptype = "thinking"
+                                elif "p" in chunk and chunk.get("p") == "response/content":
+                                    current_ptype = "text"
+
+                                # ---- status / search_status ----
+                                if "p" in chunk and chunk.get("p") == "response/status":
+                                    if chunk.get("v") == 'FINISHED':
+                                        data_queue.put(None)
+                                        break
+                                    continue
+                                if "p" in chunk and chunk.get("p") == "response/search_status":
+                                    continue
+
+                                # ---- 处理 v 字段 ----
                                 if "v" in chunk:
                                     v_value = chunk["v"]
-                                    
-                                    if "p" in chunk and chunk.get("p") == "response/status":
-                                        if v_value=='FINISHED':
-                                            data_queue.put(None)  # 结束信号
-                                            break
-                                        continue
 
-                                    if "p" in chunk and chunk.get("p") == "response/search_status":
-                                        continue
-                                                
-                                    if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                        ptype = "thinking"
-                                    elif "p" in chunk and chunk.get("p") == "response/content":
-                                        ptype = "text"
-            
-                                    # 处理字符串形式的 v 值（即文本内容）
                                     if isinstance(v_value, str):
                                         if search_enabled and v_value.startswith("[citation:"):
-                                            continue  # 跳过 citation 内容
-                                        if ptype == "thinking":
+                                            continue
+                                        if current_ptype == "thinking":
                                             think_list.append(v_value)
                                         else:
                                             text_list.append(v_value)
-            
-                                    # 处理数组更新如状态变更
+
                                     elif isinstance(v_value, list):
                                         for item in v_value:
                                             if item.get("p") == "status" and item.get("v") == "FINISHED":
@@ -1881,29 +2092,59 @@ Remember: Output ONLY the JSON, no other text. The response must start with {{ a
                         
                         try:
                             chunk = json.loads(data_str)
-                            
+                            ptype = "text"
+
+                            # ---- 新格式：初始片段状态（v.response.fragments） ----
+                            if "v" in chunk and isinstance(chunk["v"], dict) and "response" in chunk["v"]:
+                                fragments = chunk["v"]["response"].get("fragments", [])
+                                if fragments and isinstance(fragments, list) and len(fragments) > 0:
+                                    frag_type = fragments[0].get("type", "")
+                                    ptype = "thinking" if frag_type == "THINK" else "text"
+                                    frag_content = fragments[0].get("content", "")
+                                    if frag_content:
+                                        if ptype == "thinking":
+                                            final_reasoning += frag_content
+                                        else:
+                                            final_content += frag_content
+                                continue
+
+                            # ---- 新格式：fragment 追加 ----
+                            if "p" in chunk and chunk.get("p") == "response/fragments" and chunk.get("o") == "APPEND":
+                                new_frags = chunk.get("v", [])
+                                if new_frags and isinstance(new_frags, list) and len(new_frags) > 0:
+                                    frag_type = new_frags[0].get("type", "")
+                                    ptype = "thinking" if frag_type == "THINK" else "text"
+                                    frag_content = new_frags[0].get("content", "")
+                                    if frag_content:
+                                        if ptype == "thinking":
+                                            final_reasoning += frag_content
+                                        else:
+                                            final_content += frag_content
+                                continue
+
+                            # ---- 兼容旧格式 ----
+                            if "p" in chunk and chunk.get("p") == "response/thinking_content":
+                                ptype = "thinking"
+                            elif "p" in chunk and chunk.get("p") == "response/content":
+                                ptype = "text"
+
+                            # 跳过搜索状态
+                            if "p" in chunk and chunk.get("p") == "response/search_status":
+                                continue
+                            if "p" in chunk and chunk.get("p") == "response/status":
+                                continue
+
                             # 使用DeepSeek的响应格式解析 - 提取 v 字段
                             if "v" in chunk:
                                 v_value = chunk["v"]
-                                
-                                # 跳过搜索状态
-                                if "p" in chunk and chunk.get("p") == "response/search_status":
-                                    continue
-                                    
-                                # 判断内容类型
-                                ptype = "text"
-                                if "p" in chunk and chunk.get("p") == "response/thinking_content":
-                                    ptype = "thinking"
-                                elif "p" in chunk and chunk.get("p") == "response/content":
-                                    ptype = "text"
-                                
+
                                 # 处理字符串形式的 v 值（即文本内容）
                                 if isinstance(v_value, str):
                                     if ptype == "thinking":
                                         final_reasoning += v_value
                                     else:
                                         final_content += v_value
-                                        
+
                                 # 处理数组更新如状态变更
                                 elif isinstance(v_value, list):
                                     for item in v_value:
@@ -2187,21 +2428,22 @@ async def stop_stream(request: Request):
         
         # 构造请求头
         headers = get_auth_headers(request)
-        
+        ds_session = get_request_session(request)
+
         # 构造请求体
         payload = {
             "chat_session_id": chat_session_id,
             "message_id": message_id
         }
-        
+
         # 发送停止请求
-        resp = requests.post(
+        resp = ds_session.post(
             DEEPSEEK_STOP_STREAM_URL,
             headers=headers,
             json=payload,
             impersonate="safari15_3"
         )
-        
+
         if resp.status_code == 200:
             logger.info(f"[stop_stream] 成功停止会话 {chat_session_id}")
             return JSONResponse(content={"success": True, "message": "已停止流式响应"})
@@ -2211,7 +2453,7 @@ async def stop_stream(request: Request):
                 status_code=resp.status_code,
                 content={"success": False, "message": f"停止失败: {resp.text}"}
             )
-            
+
     except HTTPException:
         raise
     except Exception as e:
@@ -2246,21 +2488,22 @@ async def claude_stop_stream(request: Request):
         
         # 构造请求头
         headers = get_auth_headers(request)
-        
+        ds_session = get_request_session(request)
+
         # 构造请求体
         payload = {
             "chat_session_id": chat_session_id,
             "message_id": message_id
         }
-        
+
         # 发送停止请求
-        resp = requests.post(
+        resp = ds_session.post(
             DEEPSEEK_STOP_STREAM_URL,
             headers=headers,
             json=payload,
             impersonate="safari15_3"
         )
-        
+
         if resp.status_code == 200:
             logger.info(f"[claude_stop_stream] 成功停止会话 {chat_session_id}")
             return JSONResponse(content={"success": True, "message": "已停止流式响应"})
@@ -2282,8 +2525,8 @@ async def claude_stop_stream(request: Request):
 # (13) 路由：/
 # ----------------------------------------------------------------------
 @app.get("/")
-def index(request: Request):
-    return templates.TemplateResponse("welcome.html", {"request": request})
+def index():
+    return HTMLResponse("<!DOCTYPE html><html><head><meta charset=\"utf-8\"/><title>服务已启动</title></head><body><p>DeepSeek2API Neo 已启动！</p></body></html>")
 
 
 # ----------------------------------------------------------------------
