@@ -534,23 +534,34 @@ async def call_claude_via_openai(request: Request, claude_payload):
 
         # 判断模型类型
         model_lower = model.lower()
-        if model_lower in ["deepseek-v4-flash", "deepseek-chat", "deepseek-v3"]:
+        if model_lower in ["deepseek-v4-flash", "deepseek-chat"]:
             model_type = "default"
             auto_thinking = False
-        elif model_lower in ["deepseek-reasoner", "deepseek-r1"]:
+            lock_thinking = False
+        elif model_lower in ["deepseek-reasoner"]:
             model_type = "default"
             auto_thinking = True
+            lock_thinking = True  # deepseek-reasoner 强制开启思考，不可关闭
         elif model_lower in ["deepseek-v4-pro"]:
             model_type = "expert"
             auto_thinking = False
+            lock_thinking = False
         else:
             model_type = "default"
             auto_thinking = False
+            lock_thinking = False
 
-        # thinking_enabled 和 search_enabled 从请求中获取
-        thinking_enabled = deepseek_payload.get("thinking_enabled", auto_thinking)
-        if not isinstance(thinking_enabled, bool):
-            thinking_enabled = auto_thinking
+        # 解析 thinking，支持 thinking_enabled 和 thinking.type 两种格式
+        if lock_thinking:
+            thinking_enabled = True
+        else:
+            thinking_obj = deepseek_payload.get("thinking")
+            if isinstance(thinking_obj, dict):
+                thinking_enabled = thinking_obj.get("type") == "enabled"
+            else:
+                thinking_enabled = deepseek_payload.get("thinking_enabled", auto_thinking)
+                if not isinstance(thinking_enabled, bool):
+                    thinking_enabled = auto_thinking
         search_enabled = bool(deepseek_payload.get("search_enabled", False))
 
         # 使用 messages_prepare 函数构造最终 prompt
@@ -1066,23 +1077,33 @@ async def chat_completions(request: Request):
             )
         # 判断模型类型
         model_lower = model.lower()
-        if model_lower in ["deepseek-v4-flash", "deepseek-chat", "deepseek-v3"]:
+        if model_lower in ["deepseek-v4-flash", "deepseek-chat"]:
             model_type = "default"
             auto_thinking = False
-        elif model_lower in ["deepseek-reasoner", "deepseek-r1"]:
+            lock_thinking = False
+        elif model_lower in ["deepseek-reasoner"]:
             model_type = "default"
             auto_thinking = True
+            lock_thinking = True  # deepseek-reasoner 强制开启思考，不可关闭
         elif model_lower in ["deepseek-v4-pro"]:
             model_type = "expert"
             auto_thinking = False
+            lock_thinking = False
         else:
             raise HTTPException(
                 status_code=503, detail=f"Model '{model}' is not available."
             )
-        # thinking_enabled 默认由模型决定，请求参数可覆盖
-        thinking_enabled = req_data.get("thinking_enabled", auto_thinking)
-        if not isinstance(thinking_enabled, bool):
-            thinking_enabled = auto_thinking
+        # 解析 thinking，支持 thinking_enabled 和 thinking.type 两种格式
+        if lock_thinking:
+            thinking_enabled = True
+        else:
+            thinking_obj = req_data.get("thinking")
+            if isinstance(thinking_obj, dict):
+                thinking_enabled = thinking_obj.get("type") == "enabled"
+            else:
+                thinking_enabled = req_data.get("thinking_enabled", auto_thinking)
+                if not isinstance(thinking_enabled, bool):
+                    thinking_enabled = auto_thinking
         search_enabled = bool(req_data.get("search_enabled", False))
         
         # 处理 tools 参数（OpenAI 格式）
