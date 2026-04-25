@@ -250,7 +250,7 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
     每个 event dict 格式：{"event": "<event_name>", "data": <json-serializable>}
 
     ``state`` 是一个可变字典，调用方初始化为::
-        state = {"ptype": None, "thinking_index": 0, "text_index": 0,
+        state = {"ptype": None, "next_block_index": 0, "active_block_index": None,
                  "block_active": False, "has_thinking": False}
     """
     events: list[dict] = []
@@ -269,8 +269,9 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
 
     # ---- 辅助：启动一个 content block ----
     def _start_block(btype: str) -> dict:
-        idx = state.get(f"{btype}_index", 0)
-        state[f"{btype}_index"] = idx + 1
+        idx = state.get("next_block_index", 0)
+        state["next_block_index"] = idx + 1
+        state["active_block_index"] = idx
         state["block_active"] = True
         if btype == "thinking":
             state["has_thinking"] = True
@@ -281,24 +282,27 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
             block["text"] = ""
         return {
             "event": "content_block_start",
-            "data": {"index": idx, "content_block": block},
+            "data": {"type": "content_block_start", "index": idx, "content_block": block},
         }
 
     def _delta(btype: str, text: str) -> dict:
-        delta_key = "thinking_delta" if btype == "thinking" else "text_delta"
+        delta_type = "thinking_delta" if btype == "thinking" else "text_delta"
         return {
             "event": "content_block_delta",
             "data": {
-                "index": state.get(f"{btype}_index", 0) - 1,
-                "delta": {"type": delta_key, btype: text},
+                "type": "content_block_delta",
+                "index": state.get("active_block_index", 0),
+                "delta": {"type": delta_type, btype: text},
             },
         }
 
-    def _stop_block(btype: str) -> dict:
+    def _stop_block(_: str) -> dict:
+        idx = state.get("active_block_index", 0)
         state["block_active"] = False
+        state["active_block_index"] = None
         return {
             "event": "content_block_stop",
-            "data": {"index": state.get(f"{btype}_index", 0) - 1},
+            "data": {"type": "content_block_stop", "index": idx},
         }
 
     # ---- 判断内容类型 ----

@@ -939,8 +939,8 @@ After calling tools, you will receive the results and can continue the conversat
                     # Anthropic SSE 状态
                     sse_state: dict = {
                         "ptype": "text",
-                        "thinking_index": 0,
-                        "text_index": 0,
+                        "next_block_index": 0,
+                        "active_block_index": None,
                         "block_active": False,
                         "has_thinking": False,
                     }
@@ -1044,7 +1044,7 @@ After calling tools, you will receive the results and can continue the conversat
 
                         # 如果有 tool_calls，需要先发 tool_use content blocks
                         if tool_calls_detected:
-                            tool_index = sse_state.get("text_index", 0)
+                            tool_index = sse_state.get("next_block_index", 0)
                             for tc in tool_calls_detected:
                                 func = tc.get("function", {})
                                 try:
@@ -1060,20 +1060,22 @@ After calling tools, you will receive the results and can continue the conversat
                                 tool_start = {
                                     "event": "content_block_start",
                                     "data": {
+                                        "type": "content_block_start",
                                         "index": tool_index,
                                         "content_block": tool_use_block,
                                     },
                                 }
                                 yield f"event: {tool_start['event']}\ndata: {json.dumps(tool_start['data'], ensure_ascii=False)}\n\n"
-                                yield f"event: content_block_stop\ndata: {json.dumps({'index': tool_index}, ensure_ascii=False)}\n\n"
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index}, ensure_ascii=False)}\n\n"
                                 tool_index += 1
+                            sse_state["next_block_index"] = tool_index
 
                         # 关闭残留的 text block
                         if sse_state["block_active"]:
-                            ptype_key = sse_state["ptype"]
-                            block_index = sse_state.get(f"{ptype_key}_index", 0) - 1
-                            yield f"event: content_block_stop\ndata: {json.dumps({'index': block_index}, ensure_ascii=False)}\n\n"
+                            block_index = sse_state.get("active_block_index", 0)
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index}, ensure_ascii=False)}\n\n"
                             sse_state["block_active"] = False
+                            sse_state["active_block_index"] = None
 
                         # stop_reason
                         anth_stop_reason = "end_turn"
@@ -1126,8 +1128,8 @@ After calling tools, you will receive the results and can continue the conversat
             def collect_anthropic_data():
                 sse_state: dict = {
                     "ptype": "text",
-                    "thinking_index": 0,
-                    "text_index": 0,
+                    "next_block_index": 0,
+                    "active_block_index": None,
                     "block_active": False,
                     "has_thinking": False,
                 }
