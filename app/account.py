@@ -181,20 +181,40 @@ def ensure_hif_tokens(account, force=False):
 # ----------------------------------------------------------------------
 # 判断调用模式：配置模式 vs 用户自带 token
 # ----------------------------------------------------------------------
-def determine_mode_and_token(request: Request):
+def determine_mode_and_token(request: Request, allow_x_api_key: bool = False):
     """
-    根据请求头 Authorization 判断使用哪种模式：
-    - 如果 Bearer token 出现在 CONFIG["keys"] 中，则为配置模式，从 CONFIG["accounts"] 中随机选择一个账号（排除已尝试账号），
-      检查该账号是否已有 token，否则调用登录接口获取；
-    - 否则，直接使用请求中的 Bearer 值作为 DeepSeek token。
-    结果存入 request.state.deepseek_token；配置模式下同时存入 request.state.account 与 request.state.tried_accounts。
+    根据请求头判断使用哪种模式：
+
+    认证头优先级（按顺序检测）：
+    1. ``Authorization: Bearer <key>``（标准 OpenAI / 通用格式）
+    2. ``x-api-key``（仅当 ``allow_x_api_key=True`` 时，兼容 Anthropic SDK）
+
+    如果 Bearer token 出现在 CONFIG["keys"] 中，则为配置模式，从 CONFIG["accounts"]
+    中随机选择一个账号（排除已尝试账号），检查该账号是否已有 token，否则调用登录接口获取；
+    否则，直接使用请求中的 Bearer / x-api-key 值作为 DeepSeek token。
+
+    结果存入 request.state.deepseek_token；配置模式下同时存入
+    request.state.account 与 request.state.tried_accounts。
     """
     auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
+
+    # 优先使用 Authorization: Bearer
+    if auth_header.startswith("Bearer "):
+        caller_key = auth_header.replace("Bearer ", "", 1).strip()
+    elif allow_x_api_key:
+        # Anthropic SDK 兼容：回退到 x-api-key 头
+        x_key = request.headers.get("x-api-key", "")
+        if x_key:
+            caller_key = x_key.strip()
+        else:
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized: missing Authorization Bearer token or x-api-key.",
+            )
+    else:
         raise HTTPException(
             status_code=401, detail="Unauthorized: missing Bearer token."
         )
-    caller_key = auth_header.replace("Bearer ", "", 1).strip()
     config_keys = config.CONFIG.get("keys", [])
     if caller_key in config_keys:
         request.state.use_config_token = True
