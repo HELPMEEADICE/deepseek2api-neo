@@ -38,6 +38,23 @@
 
 **仅限自用，禁止对外提供服务或商用，避免对官方造成服务压力，否则风险自担！**
 
+## 项目结构
+
+```
+app.py                    # 向后兼容入口，实际逻辑在 app/ 包中
+app/                      # 模块化包结构
+├── __init__.py           # 包入口，导出 FastAPI app
+├── main.py               # FastAPI 应用创建、CORS、启动入口
+├── config.py             # config.json 读写、CONFIG 全局
+├── constants.py          # DeepSeek URL、请求头、路径常量
+├── models.py             # Tokenizer 初始化
+├── session.py            # curl_cffi Session 管理（账号级 + 全局）
+├── account.py            # 账号队列、登录、HIF 令牌、鉴权
+├── pow.py                # WASM PoW 计算（DeepSeekHashV1）
+├── chat.py               # 消息合并、工具调用检测
+└── routes.py             # 所有 API 路由（/v1/*, /anthropic/v1/*, /）
+```
+
 ## 接入准备
 
 一个或多个 DeepSeek 账号
@@ -213,7 +230,7 @@ nohup uvicorn app:app --host 0.0.0.0 --port 5001 > uvicorn.log 2>&1 &
   "data": [
     {
       "created": 1677610602,
-      "id": "deepseek-chat",
+      "id": "deepseek-v4-flash",
       "object": "model",
       "owned_by": "deepseek",
       "permission": []
@@ -227,14 +244,14 @@ nohup uvicorn app:app --host 0.0.0.0 --port 5001 > uvicorn.log 2>&1 &
     },
     {
       "created": 1677610602,
-      "id": "deepseek-chat-search",
+      "id": "deepseek-v4-pro",
       "object": "model",
       "owned_by": "deepseek",
       "permission": []
     },
     {
       "created": 1677610602,
-      "id": "deepseek-reasoner-search",
+      "id": "deepseek-chat",
       "object": "model",
       "owned_by": "deepseek",
       "permission": []
@@ -260,11 +277,10 @@ Authorization: Bearer [userToken value or keys]
 ```json
 {
     // model名称
-    // 默认：deepseek-chat 或 deepseek-v3
-    // 深度思考：deepseek-reasoner 或 deepseek-r1
-    // 联网搜索：deepseek-chat-search 或 deepseek-v3-search
-    // 联网搜索 + 深度思考：deepseek-reasoner-search 或 deepseek-r1-search
-    "model": "deepseek-chat",
+    // 默认：deepseek-v4-flash（别名 deepseek-chat、deepseek-v3）
+    // 深度思考：deepseek-reasoner 或 deepseek-r1（基于 v4-flash，默认开启思考）
+    // 专家模型：deepseek-v4-pro
+    "model": "deepseek-v4-flash",
     // 多轮对话基于消息合并实现，某些场景可能导致能力下降且受单轮最大token数限制
     "messages": [
         {
@@ -273,7 +289,9 @@ Authorization: Bearer [userToken value or keys]
         }
     ],
     // 如果使用流式响应请设置为true，默认false
-    "stream": false
+    "stream": false,
+    // 思考模式（默认由模型决定，可覆盖）
+    "thinking": {"type": "enabled"}
 }
 ```
 
@@ -324,14 +342,17 @@ keepalive_timeout 120;
 
 ### Token统计
 
-符合 OPENAI 接口规范
+符合 OPENAI 接口规范，思考模式下包含 reasoning_tokens 详情。
 
 示例:
 ```json
 "usage": {
   "completion_tokens": 37,
   "prompt_tokens": 1,
-  "total_tokens": 38
+  "total_tokens": 38,
+  "completion_tokens_details": {
+    "reasoning_tokens": 20
+  }
 }
 ```
 
