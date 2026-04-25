@@ -6,7 +6,7 @@
 
 支持高速流式输出、支持多轮对话、支持R1深度思考，多路账号支持，支持对话结束后自动删除 DeepSeek 会话，支持 工具函数调用。
 
-与ChatGPT接口完全兼容。
+同时兼容 **OpenAI Chat Completions** 和 **Anthropic Messages API** 两种格式，内部自动转换。
 
 ## 目录
 
@@ -20,6 +20,7 @@
 * [接口列表](#接口列表)
   * [模型列表](#模型列表)
   * [对话补全](#对话补全)
+  * [Anthropic Messages API](#anthropic-messages-api-1)
 * [注意事项](#注意事项)
   * [Nginx反代优化](#Nginx反代优化)
   * [Token统计](#Token统计)
@@ -52,7 +53,8 @@ app/                      # 模块化包结构
 ├── account.py            # 账号队列、登录、HIF 令牌、鉴权
 ├── pow.py                # WASM PoW 计算（DeepSeekHashV1）
 ├── chat.py               # 消息合并、工具调用检测
-└── routes.py             # 所有 API 路由（/v1/*, /anthropic/v1/*, /）
+├── converter.py          # OpenAI ↔ Anthropic 格式转换模块
+└── routes.py             # 所有 API 路由（/v1/*, /v1/messages, /）
 ```
 
 ## 接入准备
@@ -216,7 +218,7 @@ nohup uvicorn app:app --host 0.0.0.0 --port 5001 > uvicorn.log 2>&1 &
 
 ## 接口列表
 
-目前支持与openai兼容的 `/v1/chat/completions` 接口，可自行使用与openai或其他兼容的客户端接入接口。
+同时支持 OpenAI 兼容的 `/v1/chat/completions` 接口和 Anthropic 兼容的 `/v1/messages` 接口，可自行使用对应的客户端接入。
 
 ### 模型列表
 
@@ -319,6 +321,95 @@ Authorization: Bearer [userToken value or keys]
     "total_tokens": 38
   }
 }
+```
+
+### Anthropic Messages API
+
+兼容 Anthropic Messages API 格式，支持 Claude SDK 直接接入。
+
+**POST /v1/messages**
+
+认证方式（二选一）：
+
+```
+# 方式1：标准 Authorization（OpenAI 兼容）
+Authorization: Bearer [userToken value or keys]
+
+# 方式2：x-api-key（Anthropic SDK 兼容）
+x-api-key: [userToken value or keys]
+```
+
+请求数据：
+```json
+{
+    "model": "deepseek-v4-flash",
+    "system": "You are a helpful assistant.",
+    "messages": [
+        {
+            "role": "user",
+            "content": "你是谁？"
+        }
+    ],
+    "stream": false,
+    "max_tokens": 1024,
+    "thinking": {"type": "enabled"}
+}
+```
+
+响应数据（非流式）：
+```json
+{
+  "id": "msg_xxx",
+  "type": "message",
+  "role": "assistant",
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "用户想了解我的身份..."
+    },
+    {
+      "type": "text",
+      "text": "您好！我是智能助手DeepSeek-R1，很高兴为您服务！"
+    }
+  ],
+  "model": "deepseek-v4-flash",
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 50
+  }
+}
+```
+
+流式响应（SSE）：
+```
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_xxx","type":"message","role":"assistant","content":[],"model":"deepseek-v4-flash","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"用户想了解我的身份..."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"您好！我是智能助手DeepSeek-R1，很高兴为您服务！"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":50}}
+
+event: message_stop
+data: {"type":"message_stop"}
 ```
 
 ## 注意事项
