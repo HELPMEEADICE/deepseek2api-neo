@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepSeek2API Neo · 仪表盘</title>
+<link rel="stylesheet" href="/dashboard-assets/styles.css">
+<link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/icon?family=Material+Symbols+Rounded" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div class="app">
+
+<!-- ====== 导航栏 ====== -->
+<header class="top-bar">
+  <div class="top-bar__start">
+    <span class="material-symbols-rounded icon--large">analytics</span>
+    <h1 class="top-bar__title">DeepSeek2API Neo</h1>
+  </div>
+  <div class="top-bar__end">
+    <div class="chip">
+      <span class="material-symbols-rounded">schedule</span>
+      <span>时区: UTC+8</span>
+    </div>
+    <span class="top-bar__refresh" id="refreshBtn" title="刷新数据">
+      <span class="material-symbols-rounded">refresh</span>
+    </span>
+  </div>
+</header>
+
+<!-- ====== 主内容 ====== -->
+<main class="main-content">
+
+  <!-- 概览卡片 -->
+  <section class="section">
+    <div class="section__header">
+      <h2 class="section__title">概览</h2>
+      <div class="segmented-btn-group" id="periodBtns">
+        <button class="segmented-btn active" data-days="0">今日</button>
+        <button class="segmented-btn" data-days="7">近7天</button>
+        <button class="segmented-btn" data-days="30">近30天</button>
+      </div>
+    </div>
+
+    <div class="card-grid">
+      <div class="card card--elevated">
+        <div class="card__icon" style="background:var(--md-sys-color-tertiary-container);color:var(--md-sys-color-on-tertiary-container)">
+          <span class="material-symbols-rounded">send</span>
+        </div>
+        <div class="card__body">
+          <span class="card__label">总请求数</span>
+          <span class="card__value" id="ovRequests">--</span>
+        </div>
+      </div>
+      <div class="card card--elevated">
+        <div class="card__icon" style="background:var(--md-sys-color-primary-container);color:var(--md-sys-color-on-primary-container)">
+          <span class="material-symbols-rounded">token</span>
+        </div>
+        <div class="card__body">
+          <span class="card__label">总 Token</span>
+          <span class="card__value" id="ovTokens">--</span>
+          <div class="card__inout" id="ovInOut"></div>
+        </div>
+      </div>
+      <div class="card card--elevated" id="cardFlash">
+        <div class="card__icon" style="background:var(--md-sys-color-secondary-container);color:var(--md-sys-color-on-secondary-container)">
+          <span class="material-symbols-rounded">bolt</span>
+        </div>
+        <div class="card__body">
+          <span class="card__label">V4-Flash</span>
+          <span class="card__value" id="ovFlashReq">--</span>
+          <span class="card__sub">请求</span>
+          <div class="card__inout" id="ovFlashInOut"></div>
+        </div>
+      </div>
+      <div class="card card--elevated" id="cardPro">
+        <div class="card__icon" style="background:var(--md-sys-color-error-container);color:var(--md-sys-color-on-error-container)">
+          <span class="material-symbols-rounded">psychology</span>
+        </div>
+        <div class="card__body">
+          <span class="card__label">V4-Pro</span>
+          <span class="card__value" id="ovProReq">--</span>
+          <span class="card__sub">请求</span>
+          <div class="card__inout" id="ovProInOut"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 图表 -->
+  <section class="section">
+    <div class="section__header">
+      <h2 class="section__title">趋势</h2>
+    </div>
+    <div class="chart-grid">
+      <div class="card card--filled chart-card">
+        <h3 class="chart-title">Token 消耗（输入 / 输出）</h3>
+        <div class="chart-wrap"><canvas id="chartTokens"></canvas></div>
+      </div>
+      <div class="card card--filled chart-card">
+        <h3 class="chart-title">每日请求数</h3>
+        <div class="chart-wrap"><canvas id="chartRequests"></canvas></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 账号统计 - Flash -->
+  <section class="section">
+    <div class="section__header">
+      <h2 class="section__title">账号统计 · V4-Flash</h2>
+    </div>
+    <div class="card card--filled table-card">
+      <div class="table-wrapper">
+        <table class="md-table">
+          <thead>
+            <tr>
+              <th>账号</th>
+              <th class="r">请求数</th>
+              <th class="r">输入 Token</th>
+              <th class="r">输出 Token</th>
+              <th class="r">总计</th>
+            </tr>
+          </thead>
+          <tbody id="accountFlashTbody">
+            <tr><td colspan="5" class="empty">暂无数据</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 账号统计 - Pro -->
+  <section class="section">
+    <div class="section__header">
+      <h2 class="section__title">账号统计 · V4-Pro</h2>
+    </div>
+    <div class="card card--filled table-card">
+      <div class="table-wrapper">
+        <table class="md-table">
+          <thead>
+            <tr>
+              <th>账号</th>
+              <th class="r">请求数</th>
+              <th class="r">输入 Token</th>
+              <th class="r">输出 Token</th>
+              <th class="r">总计</th>
+            </tr>
+          </thead>
+          <tbody id="accountProTbody">
+            <tr><td colspan="5" class="empty">暂无数据</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 最近请求 -->
+  <section class="section">
+    <div class="section__header">
+      <h2 class="section__title">最近请求</h2>
+    </div>
+    <div class="card card--filled table-card">
+      <div class="table-wrapper">
+        <table class="md-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>模型</th>
+              <th>账号</th>
+              <th class="r">Prompt</th>
+              <th class="r">Completion</th>
+              <th class="r">Total</th>
+            </tr>
+          </thead>
+          <tbody id="recentTbody">
+            <tr><td colspan="6" class="empty">暂无数据</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+</div><!-- .app -->
+
+<script src="/dashboard-assets/app.js"></script>
+</body>
+</html>
