@@ -121,7 +121,7 @@ async def chat_completions(request: Request):
         model_lower = model.lower()
         if model_lower in ["deepseek-v4-flash", "deepseek-chat"]:
             model_type = "default"
-            auto_thinking = False
+            auto_thinking = True
             lock_thinking = False
         elif model_lower in ["deepseek-reasoner"]:
             model_type = "default"
@@ -129,7 +129,7 @@ async def chat_completions(request: Request):
             lock_thinking = True  # deepseek-reasoner 强制开启思考，不可关闭
         elif model_lower in ["deepseek-v4-pro"]:
             model_type = "expert"
-            auto_thinking = False
+            auto_thinking = True
             lock_thinking = False
         else:
             raise HTTPException(
@@ -142,6 +142,8 @@ async def chat_completions(request: Request):
             thinking_obj = req_data.get("thinking")
             if isinstance(thinking_obj, dict):
                 thinking_enabled = thinking_obj.get("type") == "enabled"
+            elif isinstance(thinking_obj, bool):
+                thinking_enabled = thinking_obj
             else:
                 thinking_enabled = req_data.get("thinking_enabled", auto_thinking)
                 if not isinstance(thinking_enabled, bool):
@@ -789,13 +791,13 @@ async def anthropic_messages(request: Request):
             "claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5",
         ]:
             model_type = "default"
-            auto_thinking = False
+            auto_thinking = True
         elif model_lower in ["deepseek-reasoner"]:
             model_type = "default"
             auto_thinking = True
         elif model_lower in ["deepseek-v4-pro"]:
             model_type = "expert"
-            auto_thinking = False
+            auto_thinking = True
         else:
             raise HTTPException(
                 status_code=503, detail=f"Model '{model}' is not available."
@@ -805,6 +807,8 @@ async def anthropic_messages(request: Request):
         thinking_obj = req_data.get("thinking")
         if isinstance(thinking_obj, dict) and thinking_obj.get("type") == "enabled":
             thinking_enabled = True
+        elif isinstance(thinking_obj, bool):
+            thinking_enabled = thinking_obj
         else:
             thinking_enabled = auto_thinking
 

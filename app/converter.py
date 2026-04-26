@@ -85,7 +85,7 @@ def openai_to_anthropic(body: dict) -> dict:
         if "budget_tokens" in thinking_obj:
             thinking["budget_tokens"] = thinking_obj["budget_tokens"]
         result["thinking"] = thinking
-    elif body.get("thinking_enabled", False):
+    elif body.get("thinking_enabled", True):
         result["thinking"] = {"type": "enabled"}
 
     # -- tools --
@@ -139,6 +139,8 @@ def anthropic_to_openai_request(anth_body: dict) -> dict:
     thinking = anth_body.get("thinking")
     if isinstance(thinking, dict) and thinking.get("type") == "enabled":
         result["thinking_enabled"] = True
+    elif isinstance(thinking, bool):
+        result["thinking_enabled"] = thinking
 
     # Anthropic tools → OpenAI tools
     tools = anth_body.get("tools", [])
