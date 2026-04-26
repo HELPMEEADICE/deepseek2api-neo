@@ -3,9 +3,10 @@ version: "3"
 services:
   deepseek2api:
     container_name: deepseek2api
-    image: ghcr.io/iidamie/deepseek2api:latest
+    image: ghcr.io/HELPMEEADICE/deepseek2api-neo:latest
     restart: always
     ports:
       - "5001:5001"
     volumes:
       - "./config.json:/app/config.json"
+      - "./data.db:/app/data.db"

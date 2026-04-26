@@ -1,456 +1,280 @@
-# DeepSeek2API
+# 🧠 DeepSeek2API
 
-[![](https://img.shields.io/github/license/iidamie/deepseek2api.svg)](LICENSE)
-![](https://img.shields.io/github/stars/iidamie/deepseek2api.svg)
-![](https://img.shields.io/github/forks/iidamie/deepseek2api.svg)
+[![](https://img.shields.io/github/license/HELPMEEADICE/deepseek2api-neo.svg)](LICENSE)
+![](https://img.shields.io/github/stars/HELPMEEADICE/deepseek2api-neo.svg)
+![](https://img.shields.io/github/forks/HELPMEEADICE/deepseek2api-neo.svg)
 
-支持高速流式输出、支持多轮对话、支持R1深度思考，多路账号支持，支持对话结束后自动删除 DeepSeek 会话，支持 工具函数调用。
+让 DeepSeek 用起来像 OpenAI。高速流式输出、多轮对话、R1 深度思考、多账号轮换、工具调用——全都给你包好了。
 
-同时兼容 **OpenAI Chat Completions** 和 **Anthropic Messages API** 两种格式，内部自动转换。
+**兼容 OpenAI Chat Completions** 和 **Anthropic Messages API** 两种格式，内部自动转换，所以 Claude 的 SDK 也能直接连。
 
-## 目录
+## 📖 目录
 
-* [免责声明](#免责声明)
-* [接入准备](#接入准备)
-  * [多账号接入](#多账号接入)
-* [Docker部署](#Docker部署)
-* [Docker-compose部署](#Docker-compose部署)
-* [Vercel部署](#Vercel部署)
-* [原生部署](#原生部署)
-* [接口列表](#接口列表)
-  * [模型列表](#模型列表)
-  * [对话补全](#对话补全)
-  * [Anthropic Messages API](#anthropic-messages-api-1)
-* [注意事项](#注意事项)
-  * [Nginx反代优化](#Nginx反代优化)
-  * [Token统计](#Token统计)
-* [Star History](#star-history)
-* [鸣谢](#鸣谢)
+- [🧠 DeepSeek2API](#-deepseek2api)
+  - [📖 目录](#-目录)
+  - [⚠️ 免责声明](#️-免责声明)
+  - [📁 项目结构](#-项目结构)
+  - [🔑 接入准备](#-接入准备)
+    - [多账号](#多账号)
+    - [config.json 配置](#configjson-配置)
+  - [🚀 部署方式](#-部署方式)
+    - [Docker 部署](#docker-部署)
+    - [Docker Compose 部署](#docker-compose-部署)
+    - [Vercel 部署](#vercel-部署)
+    - [原生部署](#原生部署)
+  - [📋 接口列表](#-接口列表)
+    - [模型列表](#模型列表)
+    - [对话补全](#对话补全)
+    - [Anthropic Messages API](#anthropic-messages-api)
+  - [📊 仪表盘 Dashboard](#-仪表盘-dashboard)
+  - [💭 思考模式](#-思考模式)
+  - [🔍 搜索增强](#-搜索增强)
+  - [⚡ 注意事项](#-注意事项)
+    - [Nginx 反代优化](#nginx-反代优化)
+    - [Token 统计](#token-统计)
+    - [工具调用 (tool\_calls)](#工具调用-tool_calls)
+  - [⭐ Star History](#-star-history)
+  - [🙏 鸣谢](#-鸣谢)
 
-## 免责声明
+## ⚠️ 免责声明
 
-**逆向API是不稳定的，建议前往DeepSeek官方 https://platform.deepseek.com/ 付费使用API，避免封禁的风险。**
+**逆向 API 是不稳定的。** 说人话：随时可能炸。建议去 DeepSeek 官方 https://platform.deepseek.com/ 付费使用，稳，而且支持官方。
 
-**本组织和个人不接受任何资金捐助和交易，此项目是纯粹研究交流学习性质！**
+本组织和个人不接受任何资金捐助和交易，此项目是纯粹研究交流学习性质！
 
 **仅限自用，禁止对外提供服务或商用，避免对官方造成服务压力，否则风险自担！**
 
-**仅限自用，禁止对外提供服务或商用，避免对官方造成服务压力，否则风险自担！**
-
-**仅限自用，禁止对外提供服务或商用，避免对官方造成服务压力，否则风险自担！**
-
-## 项目结构
+## 📁 项目结构
 
 ```
-app.py                    # 向后兼容入口，实际逻辑在 app/ 包中
-app/                      # 模块化包结构
-├── __init__.py           # 包入口，导出 FastAPI app
-├── main.py               # FastAPI 应用创建、CORS、启动入口
-├── config.py             # config.json 读写、CONFIG 全局
-├── constants.py          # DeepSeek URL、请求头、路径常量
-├── models.py             # Tokenizer 初始化
-├── session.py            # curl_cffi Session 管理（账号级 + 全局）
-├── account.py            # 账号队列、登录、HIF 令牌、鉴权
-├── pow.py                # WASM PoW 计算（DeepSeekHashV1）
-├── chat.py               # 消息合并、工具调用检测
-├── converter.py          # OpenAI ↔ Anthropic 格式转换模块
-└── routes.py             # 所有 API 路由（/v1/*, /v1/messages, /）
+app_visualization.py        # 🚀 **推荐入口** — 原 API + 统计仪表盘二合一，启动这个就行
+app.py                      # 向后兼容入口，实际逻辑在 app/ 包中
+web/                        # 仪表盘前端（Material Design 3）
+├── index.html
+├── app.js
+└── styles.css
+data.db                     # 统计数据库（自动生成）
+app/                        # 核心逻辑包
+├── main.py                 # FastAPI 应用创建、CORS、启动
+├── config.py               # config.json 读写
+├── constants.py            # DeepSeek URL、请求头、路径常量
+├── models.py               # Tokenizer 加载
+├── session.py              # curl_cffi Session 管理
+├── account.py              # 账号队列、登录、鉴权
+├── pow.py                  # WASM PoW 计算（DeepSeekHashV1）
+├── chat.py                 # 消息合并、工具调用检测
+├── converter.py            # OpenAI ↔ Anthropic 格式互转
+└── routes.py               # 所有 API 路由
+config.json                 # 你的配置（密钥 + 账号）
 ```
 
-## 接入准备
+## 🔑 接入准备
 
-一个或多个 DeepSeek 账号
+需要一个或多个 DeepSeek 账号
 
-### 多账号接入
+### 多账号
 
-目前同个账号同时只能有*一路*输出，你可以通过提供多个账号并使用。
+同一个账号同一时间只能跑**一路**输出。配置多个账号，请求会自动轮换。
 
-每次请求服务会从中挑选一个。
+### config.json 配置
 
-## Docker部署
-
-请准备一台具有公网IP的服务器并将5001端口开放。
-
-配置 config.json
-
-在 `deepseek` 目录下，创建 config.json文件
 ```json
 {
-  "keys": [
-    "key1",
-    "key2"
-  ],
+  "keys": ["key1", "key2"],
   "accounts": [
-    {
-      "email": "example1@example.com",
-      "password": "password1",
-      "token": ""
-    },
-    {
-      "email": "example2@example.com",
-      "password": "password2",
-      "token": ""
-    },
-    {
-      "mobile": "12345678901",
-      "password": "password3",
-      "token": ""
-    },
-    {
-      "mobile": "12345678901",
-      "password": "password4",
-      "token": ""
-    }
+    { "email": "user@example.com", "password": "your-password", "token": "" },
+    { "mobile": "13800138000", "password": "your-password", "token": "" }
   ]
 }
 ```
- * keys - 你的 API 鉴权密钥
- * accounts - DeepSeek 账号列表，支持多个账号轮换，避免单账号受限
 
-拉取镜像并启动服务。
+- `keys` - 你的 API 鉴权密钥，请求时放在 `Authorization: Bearer xxx` 里
+- `accounts` - DeepSeek 账号列表，支持邮箱或手机登录
+
+## 🚀 部署方式
+
+### Docker 部署
 
 ```shell
-docker run -d -p 5001:5001 -v "$(pwd)/config.json:/app/config.json" --name deepseek2api ghcr.io/iidamie/deepseek2api:latest
+docker run -d \
+  -p 5001:5001 \
+  -v "$(pwd)/config.json:/app/config.json" \
+  -v "$(pwd)/data.db:/app/data.db" \
+  --name deepseek2api \
+  ghcr.io/HELPMEEADICE/deepseek2api-neo:latest
 ```
 
-查看服务实时日志
+查看日志：`docker logs -f deepseek2api`
+
+### Docker Compose 部署
 
 ```shell
-docker logs -f deepseek2api
-```
-
-重启服务
-
-```shell
-docker restart deepseek2api
-```
-
-停止服务
-
-```shell
-docker stop deepseek2api
-```
-
-## Docker-compose部署
-
-拉取该项目
-```shell
-git clone https://github.com/iidamie/deepseek2api.git
+git clone https://github.com/HELPMEEADICE/deepseek2api-neo.git
 cd deepseek2api
-```
-配置 config.json
-
-在当前目录下，修改 config.json 文件
- * keys - 你的 API 鉴权密钥
- * accounts - DeepSeek 账号列表，支持多个账号轮换，避免单账号受限
-
-启动服务
-
-```shell
+# 修改 config.json
 docker-compose up -d
 ```
 
-查看服务实时日志
-
-```shell
-docker logs -f deepseek2api
-```
-
-重启服务
-
-```shell
-docker restart deepseek2api
-```
-
-停止服务
-
-```shell
-docker stop deepseek2api
-```
-
-## Vercel部署
+### Vercel 部署
 
 > [!NOTE]
-> Vercel免费账户的请求响应超时时间为10秒，但接口响应通常较久，可能会遇到Vercel返回的504超时错误！
+> Vercel 免费版请求超时 10 秒，接口响应时间可能更长，可能会 504。
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/import/project?template=https://github.com/iidamie/deepseek2api)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/import/project?template=https://github.com/HELPMEEADICE/deepseek2api-neo)
 
-部署完后，返回你的 Github 仓库配置 config.json
- * keys - 你的 API 鉴权密钥
- * accounts - DeepSeek 账号列表，支持多个账号轮换，避免单账号受限
+部署完后回 GitHub 仓库配 config.json，**一定要私库！**
 
-> [!WARNING]  
-> 一定要是私库，防止信息泄露！
-
-配置完后，返回 Vercel 控制台，重新部署即可
-
-## 原生部署
-
-请准备一台具有公网IP的服务器并将5001端口开放。
-
-请先安装好 Python 环境并且配置好环境变量，确认 python 命令可用。
-
-安装依赖
+### 原生部署
 
 ```shell
-git clone https://github.com/iidamie/deepseek2api.git
+git clone https://github.com/HELPMEEADICE/deepseek2api-neo.git
 cd deepseek2api
 pip install -r requirements.txt
+# 修改 config.json
+python app_visualization.py
 ```
 
-配置 config.json
-
-在当前目录下，修改 config.json 文件
- * keys - 你的 API 鉴权密钥
- * accounts - DeepSeek 账号列表，支持多个账号轮换，避免单账号受限
-
-启动服务
+后台挂起：
 
 ```shell
-python app.py
+nohup uvicorn app_visualization:app --host 0.0.0.0 --port 5001 > uvicorn.log 2>&1 &
 ```
 
-使用 nohup 启动
+## 📋 接口列表
 
-```shell
-nohup uvicorn app:app --host 0.0.0.0 --port 5001 > uvicorn.log 2>&1 &
-```
-
-## 接口列表
-
-同时支持 OpenAI 兼容的 `/v1/chat/completions` 接口和 Anthropic 兼容的 `/v1/messages` 接口，可自行使用对应的客户端接入。
+同时支持 OpenAI 兼容的 `/v1/chat/completions` 和 Anthropic 兼容的 `/v1/messages`，用你喜欢的 SDK 就行。
 
 ### 模型列表
 
-获取模型列表接口
-
 **GET /v1/models**
 
-响应数据:
 ```json
 {
   "data": [
-    {
-      "created": 1677610602,
-      "id": "deepseek-v4-flash",
-      "object": "model",
-      "owned_by": "deepseek",
-      "permission": []
-    },
-    {
-      "created": 1677610602,
-      "id": "deepseek-reasoner",
-      "object": "model",
-      "owned_by": "deepseek",
-      "permission": []
-    },
-    {
-      "created": 1677610602,
-      "id": "deepseek-v4-pro",
-      "object": "model",
-      "owned_by": "deepseek",
-      "permission": []
-    },
-    {
-      "created": 1677610602,
-      "id": "deepseek-chat",
-      "object": "model",
-      "owned_by": "deepseek",
-      "permission": []
-    }
-  ],
-  "object": "list"
+    { "id": "deepseek-v4-flash",         "object": "model" },
+    { "id": "deepseek-v4-flash-search",  "object": "model" },
+    { "id": "deepseek-chat",             "object": "model" },
+    { "id": "deepseek-chat-search",      "object": "model" },
+    { "id": "deepseek-reasoner",         "object": "model" },
+    { "id": "deepseek-reasoner-search",  "object": "model" },
+    { "id": "deepseek-v4-pro",           "object": "model" },
+    { "id": "deepseek-v4-pro-search",    "object": "model" }
+  ]
 }
 ```
+
+每个模型都有带 `-search` 后缀的版本，自动开启联网搜索。
 
 ### 对话补全
 
-对话补全接口，与openai的 [chat-completions-api](https://platform.openai.com/docs/guides/text-generation/chat-completions-api) 兼容。
-
 **POST /v1/chat/completions**
 
-header 需要设置 Authorization 头部：
+完全兼容 [OpenAI Chat Completions API](https://platform.openai.com/docs/guides/text-generation/chat-completions-api)。
 
-```
-Authorization: Bearer [userToken value or keys]
-```
-
-请求数据：
 ```json
 {
-    // model名称
-    // 默认：deepseek-v4-flash（别名 deepseek-chat、deepseek-v3）
-    // 深度思考：deepseek-reasoner 或 deepseek-r1（基于 v4-flash，默认开启思考）
-    // 专家模型：deepseek-v4-pro
-    "model": "deepseek-v4-flash",
-    // 多轮对话基于消息合并实现，某些场景可能导致能力下降且受单轮最大token数限制
-    "messages": [
-        {
-            "role": "user",
-            "content": "你是谁？"
-        }
-    ],
-    // 如果使用流式响应请设置为true，默认false
-    "stream": false,
-    // 思考模式（默认由模型决定，可覆盖）
-    "thinking": {"type": "enabled"}
-}
-```
-
-响应数据：
-```json
-{
-  "choices": [
-    {
-      "finish_reason": "stop",
-      "index": 0,
-      "message": {
-        "content": "您好！我是由中国的深度求索（DeepSeek）公司开发的智能助手DeepSeek-R1。如您有任何任何问题，我会尽我所能为您提供帮助。",
-        "reasoning_content": "您好！我是由中国的深度求索（DeepSeek）公司开发的智能助手DeepSeek-R1。如您有任何任何问题，我会尽我所能为您提供帮助。\n",
-        "role": "assistant"
-      }
-    }
-  ],
-  "created": 1738598554,
-  "id": "bc223da6-f091-4687-9f59-b9f2a917bd49",
-  "model": "deepseek-r1",
-  "object": "chat.completion",
-  "usage": {
-    "completion_tokens": 37,
-    "prompt_tokens": 1,
-    "total_tokens": 38
-  }
+  "model": "deepseek-v4-flash",
+  "messages": [{ "role": "user", "content": "你是谁？" }],
+  "stream": false,
+  "thinking": {"type": "enabled"},
+  "tools": [...]
 }
 ```
 
 ### Anthropic Messages API
 
-兼容 Anthropic Messages API 格式，支持 Claude SDK 直接接入。
-
 **POST /v1/messages**
 
-认证方式（二选一）：
+兼容 Claude SDK，认证方式二选一：
 
 ```
-# 方式1：标准 Authorization（OpenAI 兼容）
-Authorization: Bearer [userToken value or keys]
-
-# 方式2：x-api-key（Anthropic SDK 兼容）
-x-api-key: [userToken value or keys]
+Authorization: Bearer your-key
+x-api-key: your-key
 ```
 
-请求数据：
 ```json
 {
-    "model": "deepseek-v4-flash",
-    "system": "You are a helpful assistant.",
-    "messages": [
-        {
-            "role": "user",
-            "content": "你是谁？"
-        }
-    ],
-    "stream": false,
-    "max_tokens": 1024,
-    "thinking": {"type": "enabled"}
-}
-```
-
-响应数据（非流式）：
-```json
-{
-  "id": "msg_xxx",
-  "type": "message",
-  "role": "assistant",
-  "content": [
-    {
-      "type": "thinking",
-      "thinking": "用户想了解我的身份..."
-    },
-    {
-      "type": "text",
-      "text": "您好！我是智能助手DeepSeek-R1，很高兴为您服务！"
-    }
-  ],
   "model": "deepseek-v4-flash",
-  "stop_reason": "end_turn",
-  "stop_sequence": null,
-  "usage": {
-    "input_tokens": 10,
-    "output_tokens": 50
-  }
+  "system": "You are a helpful assistant.",
+  "messages": [{ "role": "user", "content": "你是谁？" }],
+  "stream": false,
+  "thinking": {"type": "enabled"}
 }
 ```
 
-流式响应（SSE）：
-```
-event: message_start
-data: {"type":"message_start","message":{"id":"msg_xxx","type":"message","role":"assistant","content":[],"model":"deepseek-v4-flash","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":1}}}
+## 📊 仪表盘 Dashboard
 
-event: content_block_start
-data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+打开浏览器访问 `http://你服务器IP:5001/dashboard`，就能看到：
 
-event: content_block_delta
-data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"用户想了解我的身份..."}}
+- 📈 每日请求数、Token 消耗
+- 🎯 按模型分（Flash / Pro）的输入输出统计
+- 👤 每个账号的用量明细
+- 🔄 自动刷新，支持今日 / 近7天 / 近30天切换
 
-event: content_block_stop
-data: {"type":"content_block_stop","index":0}
+技术栈：Material Design 3 + Chart.js，暗色模式自适应。
 
-event: content_block_start
-data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+这就是为什么我们**推荐你启动 `app_visualization.py` 而不是 `app.py`**——API 能力完全一样，多了一个漂亮的仪表盘，不亏。
 
-event: content_block_delta
-data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"您好！我是智能助手DeepSeek-R1，很高兴为您服务！"}}
+## 💭 思考模式
 
-event: content_block_stop
-data: {"type":"content_block_stop","index":1}
+模型默认开启思考，支持两种关闭方式：
 
-event: message_delta
-data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":50}}
+```json
+// OpenAI 格式
+{ "model": "deepseek-v4-flash", "thinking_enabled": false }
 
-event: message_stop
-data: {"type":"message_stop"}
+// Anthropic 格式
+{ "model": "deepseek-v4-flash", "thinking": false }
 ```
 
-## 注意事项
+- `deepseek-reasoner` **强制开启思考**，不能关
+- `deepseek-v4-flash` / `deepseek-v4-pro` 默认开，可关
 
-### Nginx反代优化
+## 🔍 搜索增强
 
-如果您正在使用Nginx反向代理deepseek2api，请添加以下配置项优化流的输出效果，优化体验感。
+模型名后面加 `-search` 后缀即可开启联网搜索：
+
+```json
+{ "model": "deepseek-v4-flash-search" }
+```
+
+也可以在请求体里传 `search_enabled: true` 达到同样的效果。
+
+## ⚡ 注意事项
+
+### Nginx 反代优化
 
 ```nginx
-# 关闭代理缓冲。当设置为off时，Nginx会立即将客户端请求发送到后端服务器，并立即将从后端服务器接收到的响应发送回客户端。
 proxy_buffering off;
-# 启用分块传输编码。分块传输编码允许服务器为动态生成的内容分块发送数据，而不需要预先知道内容的大小。
 chunked_transfer_encoding on;
-# 开启TCP_NOPUSH，这告诉Nginx在数据包发送到客户端之前，尽可能地发送数据。这通常在sendfile使用时配合使用，可以提高网络效率。
 tcp_nopush on;
-# 开启TCP_NODELAY，这告诉Nginx不延迟发送数据，立即发送小数据包。在某些情况下，这可以减少网络的延迟。
 tcp_nodelay on;
-# 设置保持连接的超时时间，这里设置为120秒。如果在这段时间内，客户端和服务器之间没有进一步的通信，连接将被关闭。
 keepalive_timeout 120;
 ```
 
-### Token统计
+### Token 统计
 
-符合 OPENAI 接口规范，思考模式下包含 reasoning_tokens 详情。
+符合 OpenAI 规范，思考模式下返回 `reasoning_tokens`：
 
-示例:
 ```json
 "usage": {
   "completion_tokens": 37,
   "prompt_tokens": 1,
   "total_tokens": 38,
-  "completion_tokens_details": {
-    "reasoning_tokens": 20
-  }
+  "completion_tokens_details": { "reasoning_tokens": 20 }
 }
 ```
 
-## Star History
+### 工具调用 (tool_calls)
 
-[![Star History Chart](https://api.star-history.com/svg?repos=iidamie/deepseek2api&type=Date)](https://star-history.com/#iidamie/deepseek2api&Date)
+支持 OpenAI 标准的 `tools` 参数，返回 `finish_reason: "tool_calls"`。
 
-## 鸣谢
+支持多轮工具对话：assistant 返回 `tool_calls` → 客户端执行工具 → 把结果作为 `tool` 角色发回来 → 模型继续回答。
 
-本项目部分代码参考了 [LLM-Red-Team/deepseek-free-api](https://github.com/LLM-Red-Team/deepseek-free-api)，在此表示感谢
+## ⭐ Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=HELPMEEADICE/deepseek2api-neo&type=Date)](https://star-history.com/#HELPMEEADICE/deepseek2api-neo&Date)
+
+## 🙏 鸣谢
+
+部分代码参考了 [LLM-Red-Team/deepseek-free-api](https://github.com/LLM-Red-Team/deepseek-free-api)，在此表示感谢。
