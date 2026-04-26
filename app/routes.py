@@ -55,38 +55,32 @@ def _delete_deepseek_session(request: Request, session_id: str):
 # ----------------------------------------------------------------------
 # 路由：/v1/models
 # ----------------------------------------------------------------------
+BASE_MODELS = [
+    "deepseek-v4-flash",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "deepseek-v4-pro",
+]
+
+
 @router.get("/v1/models")
 def list_models():
-    models_list = [
-        {
-            "id": "deepseek-v4-flash",
+    models_list = []
+    for base_id in BASE_MODELS:
+        models_list.append({
+            "id": base_id,
             "object": "model",
             "created": 1677610602,
             "owned_by": "deepseek",
             "permission": [],
-        },
-        {
-            "id": "deepseek-reasoner",
+        })
+        models_list.append({
+            "id": f"{base_id}-search",
             "object": "model",
             "created": 1677610602,
             "owned_by": "deepseek",
             "permission": [],
-        },
-        {
-            "id": "deepseek-v4-pro",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
-        {
-            "id": "deepseek-chat",
-            "object": "model",
-            "created": 1677610602,
-            "owned_by": "deepseek",
-            "permission": [],
-        },
-    ]
+        })
     data = {"object": "list", "data": models_list}
     return JSONResponse(content=data, status_code=200)
 
@@ -117,8 +111,14 @@ async def chat_completions(request: Request):
             raise HTTPException(
                 status_code=400, detail="Request must include 'model' and 'messages'."
             )
-        # 判断模型类型
-        model_lower = model.lower()
+        # 判断模型类型（支持 -search 后缀）
+        model_lower = model.lower().strip()
+        if model_lower.endswith("-search"):
+            model_lower = model_lower[:-7]
+            search_by_model = True
+        else:
+            search_by_model = False
+
         if model_lower in ["deepseek-v4-flash", "deepseek-chat"]:
             model_type = "default"
             auto_thinking = True
@@ -148,7 +148,7 @@ async def chat_completions(request: Request):
                 thinking_enabled = req_data.get("thinking_enabled", auto_thinking)
                 if not isinstance(thinking_enabled, bool):
                     thinking_enabled = auto_thinking
-        search_enabled = bool(req_data.get("search_enabled", False))
+        search_enabled = bool(req_data.get("search_enabled", False)) or search_by_model
 
         # 处理 tools 参数（OpenAI 格式）
         tools_requested = req_data.get("tools") or []
@@ -784,8 +784,14 @@ async def anthropic_messages(request: Request):
         req_data = await request.json()
         model = req_data.get("model", "deepseek-v4-flash")
 
-        # ---------- 模型类型 ----------
-        model_lower = model.lower()
+        # ---------- 模型类型（支持 -search 后缀） ----------
+        model_lower = model.lower().strip()
+        if model_lower.endswith("-search"):
+            model_lower = model_lower[:-7]
+            search_by_model = True
+        else:
+            search_by_model = False
+
         if model_lower in [
             "deepseek-v4-flash", "deepseek-chat",
             "claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5",
@@ -812,7 +818,7 @@ async def anthropic_messages(request: Request):
         else:
             thinking_enabled = auto_thinking
 
-        search_enabled = bool(req_data.get("search_enabled", False))
+        search_enabled = bool(req_data.get("search_enabled", False)) or search_by_model
 
         # ---------- System + Messages ----------
         system_text = req_data.get("system", "")

@@ -127,9 +127,10 @@ def init_db():
 
 
 def get_display_model(model_name: str) -> str:
-    return MODEL_DISPLAY_MAP.get(
-        model_name.lower() if model_name else "", model_name or "unknown"
-    )
+    base = model_name.lower().strip()
+    if base.endswith("-search"):
+        base = base[:-7]
+    return MODEL_DISPLAY_MAP.get(base, model_name or "unknown")
 
 
 def record_usage(ts, date, endpoint, model, account_id, api_key,
