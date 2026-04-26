@@ -6,6 +6,7 @@ DeepSeek2API Neo Visualization — 基于 FastAPI 的 API 代理 + Material Desi
 启动: python app_visualization.py
 """
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -16,7 +17,6 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from starlette.middleware.base import BaseHTTPMiddleware
 
 # ---------------------------------------------------------------------------
 # 导入原始 app — 包含所有 API 端点
@@ -177,15 +177,31 @@ def record_usage(ts, date, endpoint, model, account_id, api_key,
 
 
 # =============================================================================
-#  统计中间件
+#  统计中间件（纯 ASGI，避免 BaseHTTPMiddleware 与流式响应的冲突）
 # =============================================================================
-class StatsMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        path = request.url.path
+class StatsASGIMiddleware:
+    """在 ASGI 层面捕获请求/响应信息，记录统计到 SQLite"""
 
-        if path not in TRACKED_ENDPOINTS:
-            return await call_next(request)
+    def __init__(self, app):
+        self.app = app
 
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] not in TRACKED_ENDPOINTS:
+            await self.app(scope, receive, send)
+            return
+
+        # 1) 从 ASGI receive 完整读取请求体
+        body_chunks = []
+        more_body = True
+        while more_body:
+            msg = await receive()
+            body = msg.get("body", b"")
+            if body:
+                body_chunks.append(body)
+            more_body = msg.get("more_body", False)
+        body_bytes = b"".join(body_chunks)
+
+        # 2) 解析请求参数
         start_ts = time.time()
         date_str = datetime.now().strftime("%Y-%m-%d")
         model = "unknown"
@@ -193,8 +209,6 @@ class StatsMiddleware(BaseHTTPMiddleware):
         thinking = True
         prompt_est = 0
 
-        # 1) 捕获请求体
-        body_bytes = await request.body()
         if body_bytes:
             try:
                 data = json.loads(body_bytes)
@@ -215,59 +229,67 @@ class StatsMiddleware(BaseHTTPMiddleware):
             except Exception:
                 pass
 
-        # 2) 恢复请求体，下游路由可正常 json() 读取
-        async def _receive():
-            return {"type": "http.request", "body": body_bytes, "more_body": False}
-        request._receive = _receive
+        # 3) 构造 wrapped_receive：首次返回缓存 body，后续透传（断连检测）
+        body_consumed = False
 
-        # 3) 执行下游
-        response = await call_next(request)
+        async def wrapped_receive():
+            nonlocal body_consumed
+            if not body_consumed:
+                body_consumed = True
+                return {"type": "http.request", "body": body_bytes, "more_body": False}
+            return await receive()
 
-        # 4) 提取账号（由 determine_mode_and_token 注入到 request.state）
+        # 4) 非流式：拦截 response body 以提取精确 token
+        capture_response = not stream
+        captured_body = bytearray()
+
+        async def wrapped_send(message):
+            if capture_response and message["type"] == "http.response.body":
+                captured_body.extend(message.get("body", b""))
+            await send(message)
+
+        # 5) 执行下游
+        if capture_response:
+            await self.app(scope, wrapped_receive, wrapped_send)
+        else:
+            await self.app(scope, wrapped_receive, send)
+
+        # 6) 提取账号（由 determine_mode_and_token 注入到 request.state，通过 scope["state"]）
         account_id = ""
-        if hasattr(request.state, "account"):
-            acc = getattr(request.state, "account", None)
+        try:
+            # ASGI 中 request.state 通过 scope["state"] 传递
+            state = scope.get("state", {})
+            acc = state.get("account")
             if acc and isinstance(acc, dict):
                 account_id = acc.get("email") or acc.get("mobile") or ""
+        except Exception:
+            pass
 
-        # 5) 非流式：从响应体提取精确 token（覆盖估算值）
+        # 7) 非流式响应提取精确 token
         completion = 0
         total = prompt_est
-        if not stream:
+        if capture_response and captured_body:
             try:
-                raw = b""
-                async for chunk in response.body_iterator:
-                    raw += chunk
-                if raw:
-                    resp_data = json.loads(raw)
-                    usage = resp_data.get("usage", {})
-                    if usage:
-                        prompt_est = usage.get("prompt_tokens", prompt_est)
-                        completion = usage.get("completion_tokens", 0)
-                        total = usage.get("total_tokens", prompt_est + completion)
-                # 重新构建 Response（body_iterator 已消费）
-                response = Response(
-                    content=raw,
-                    status_code=response.status_code,
-                    headers=dict(response.headers),
-                    media_type=response.media_type,
-                )
+                resp_data = json.loads(bytes(captured_body))
+                usage = resp_data.get("usage", {})
+                if usage:
+                    prompt_est = usage.get("prompt_tokens", prompt_est)
+                    completion = usage.get("completion_tokens", 0)
+                    total = usage.get("total_tokens", prompt_est + completion)
             except Exception:
                 pass
 
-        # 6) 写入统计
+        # 8) 写入统计
         try:
-            record_usage(start_ts, date_str, path, model,
+            record_usage(start_ts, date_str, scope["path"], model,
                          account_id, "", stream, thinking,
                          prompt_est, completion, total)
         except Exception as e:
-            logger.error(f"[StatsMiddleware] record_usage 异常: {e}")
-
-        return response
+            logger.error(f"[StatsASGIMiddleware] record_usage 异常: {e}")
 
 
-# 将中间件添加到原始 app（在已有 CORS 之后）
-app.add_middleware(StatsMiddleware)
+# 将 ASGI 中间件添加到原始 app
+app.add_middleware(StatsASGIMiddleware)
 
 # 静态文件服务（仪表盘 CSS/JS）
 if WEB_DIR.is_dir():
