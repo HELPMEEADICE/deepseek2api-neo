@@ -400,9 +400,41 @@ After calling tools, you will receive the results and can continue the conversat
                                 if has_tools:
                                     tool_calls_detected, final_text_content = chat.detect_and_parse_tool_calls(final_text)
 
+                                if tool_calls_detected and final_text_content != final_text:
+                                    # Do not leak the raw JSON instruction payload as assistant text.
+                                    final_text = final_text_content
+
+                                if has_tools and final_text:
+                                    text_delta = {"content": final_text}
+                                    if not first_chunk_sent:
+                                        text_delta["role"] = "assistant"
+                                        first_chunk_sent = True
+                                    text_chunk = {
+                                        "id": completion_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_time,
+                                        "model": model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": text_delta,
+                                            "finish_reason": None,
+                                        }],
+                                    }
+                                    yield f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n"
+                                    last_send_time = current_time
+
                                 # 如果检测到 tool_calls，先发送 tool_calls chunk
                                 if tool_calls_detected:
-                                    for tool_call in tool_calls_detected:
+                                    for tool_index, tool_call in enumerate(tool_calls_detected):
+                                        delta_obj = {
+                                            "tool_calls": [{
+                                                "index": tool_index,
+                                                **tool_call,
+                                            }]
+                                        }
+                                        if not first_chunk_sent:
+                                            delta_obj["role"] = "assistant"
+                                            first_chunk_sent = True
                                         tool_call_chunk = {
                                             "id": completion_id,
                                             "object": "chat.completion.chunk",
@@ -411,9 +443,7 @@ After calling tools, you will receive the results and can continue the conversat
                                             "choices": [
                                                 {
                                                     "index": 0,
-                                                    "delta": {
-                                                        "tool_calls": [tool_call]
-                                                    },
+                                                    "delta": delta_obj,
                                                     "finish_reason": None,
                                                 }
                                             ],
@@ -474,6 +504,12 @@ After calling tools, you will receive the results and can continue the conversat
                                         final_thinking += ctext
                                 elif ctype == "text":
                                     final_text += ctext
+
+                                # When tools are enabled, buffer text until completion so raw
+                                # {"tool_calls": ...} JSON is not streamed into chat UIs.
+                                if has_tools and ctype == "text":
+                                    continue
+
                                 delta_obj = {}
                                 if not first_chunk_sent:
                                     delta_obj["role"] = "assistant"

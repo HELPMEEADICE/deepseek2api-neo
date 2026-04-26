@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 import time
 
 from . import constants, session as session_module
@@ -24,6 +23,21 @@ def messages_prepare(messages: list) -> str:
     for m in messages:
         role = m.get("role", "")
         content = m.get("content", "")
+        if role == "tool":
+            tool_call_id = m.get("tool_call_id", "")
+            name = m.get("name", "")
+            content = (
+                f"Tool result"
+                f"{f' for {name}' if name else ''}"
+                f"{f' ({tool_call_id})' if tool_call_id else ''}:\n{content}"
+            )
+            role = "user"
+        elif role == "assistant" and m.get("tool_calls"):
+            content = content or ""
+            tool_calls_json = json.dumps(
+                {"tool_calls": m.get("tool_calls", [])}, ensure_ascii=False
+            )
+            content = f"{content}\n{tool_calls_json}".strip()
         if isinstance(content, list):
             texts = [
                 item.get("text", "") for item in content if item.get("type") == "text"
@@ -62,63 +76,102 @@ def messages_prepare(messages: list) -> str:
 # ----------------------------------------------------------------------
 # 工具调用检测
 # ----------------------------------------------------------------------
+def _find_balanced_json_objects(content: str):
+    """Yield (start, end, json_text) for brace-balanced JSON objects in content."""
+    in_string = False
+    escape = False
+    depth = 0
+    start = None
+
+    for idx, ch in enumerate(content):
+        if start is None:
+            if ch == "{":
+                start = idx
+                depth = 1
+                in_string = False
+                escape = False
+            continue
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = idx + 1
+                yield start, end, content[start:end]
+                start = None
+
+
+def _normalize_tool_calls(tool_calls):
+    valid_calls = []
+    if isinstance(tool_calls, dict):
+        tool_calls = [tool_calls]
+    elif not isinstance(tool_calls, list):
+        return valid_calls
+
+    for i, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            continue
+
+        call_id = call.get("id") or f"call_{i + 1:03d}"
+        call_type = call.get("type") or "function"
+        func = call.get("function")
+
+        # Be permissive for common model outputs: {"name":..., "arguments":...}
+        if func is None and "name" in call:
+            func = {"name": call.get("name"), "arguments": call.get("arguments", {})}
+
+        if not isinstance(func, dict) or not func.get("name"):
+            continue
+
+        args = func.get("arguments", "{}")
+        if isinstance(args, dict):
+            args = json.dumps(args, ensure_ascii=False)
+        elif args is None:
+            args = "{}"
+        else:
+            args = str(args)
+
+        valid_calls.append({
+            "id": str(call_id),
+            "type": str(call_type),
+            "function": {
+                "name": str(func["name"]),
+                "arguments": args,
+            },
+        })
+
+    return valid_calls
+
+
 def detect_and_parse_tool_calls(content: str):
     """
     检测并解析模型返回的 tool_calls JSON
     返回: (tool_calls_list, remaining_content)
     """
-    # 尝试匹配 JSON 格式的 tool_calls
-    # 支持多种格式：{"tool_calls": [...]} 或直接 [...] 数组
-    tool_calls = None
-    remaining_content = content
-
-    # 模式1: {"tool_calls": [...]}
-    pattern1 = r'\{[\s\n]*"tool_calls"[\s\n]*:[\s\n]*\[(.*?)\][\s\n]*\}'
-    match1 = re.search(pattern1, content, re.DOTALL)
-
-    if match1:
+    for start, end, json_str in _find_balanced_json_objects(content):
         try:
-            # 提取完整的 JSON 对象
-            json_str = match1.group(0)
             parsed = json.loads(json_str)
-            if "tool_calls" in parsed and isinstance(parsed["tool_calls"], list):
-                tool_calls = parsed["tool_calls"]
-                # 移除 tool_calls JSON，保留其他内容
-                remaining_content = content[:match1.start()] + content[match1.end():]
-                remaining_content = remaining_content.strip()
         except json.JSONDecodeError:
-            pass
+            continue
 
-    # 如果找到了 tool_calls，验证格式并返回
-    if tool_calls:
-        # 确保每个 tool_call 有必需的字段
-        valid_calls = []
-        for i, call in enumerate(tool_calls):
-            if not isinstance(call, dict):
-                continue
+        if not isinstance(parsed, dict) or "tool_calls" not in parsed:
+            continue
 
-            # 生成 call_id（如果没有）
-            call_id = call.get("id", f"call_{i+1:03d}")
-            call_type = call.get("type", "function")
-
-            if "function" in call:
-                func = call["function"]
-                if isinstance(func, dict) and "name" in func:
-                    # 确保 arguments 是字符串
-                    args = func.get("arguments", "{}")
-                    if isinstance(args, dict):
-                        args = json.dumps(args, ensure_ascii=False)
-
-                    valid_calls.append({
-                        "id": call_id,
-                        "type": call_type,
-                        "function": {
-                            "name": func["name"],
-                            "arguments": args
-                        }
-                    })
-
+        valid_calls = _normalize_tool_calls(parsed.get("tool_calls"))
         if valid_calls:
+            remaining_content = (content[:start] + content[end:]).strip()
             return valid_calls, remaining_content
 
     return None, content
