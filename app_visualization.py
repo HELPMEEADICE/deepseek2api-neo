@@ -239,25 +239,20 @@ class StatsASGIMiddleware:
                 return {"type": "http.request", "body": body_bytes, "more_body": False}
             return await receive()
 
-        # 4) 非流式：拦截 response body 以提取精确 token
-        capture_response = not stream
-        captured_body = bytearray()
+        # 4) 始终拦截 response body 以提取 token（流式 SSE 也包含最后一条 usage 信息）
+        response_body = bytearray()
 
         async def wrapped_send(message):
-            if capture_response and message["type"] == "http.response.body":
-                captured_body.extend(message.get("body", b""))
+            if message["type"] == "http.response.body":
+                response_body.extend(message.get("body", b""))
             await send(message)
 
-        # 5) 执行下游
-        if capture_response:
-            await self.app(scope, wrapped_receive, wrapped_send)
-        else:
-            await self.app(scope, wrapped_receive, send)
+        # 5) 执行下游（始终使用 wrapped_send 捕获所有 body）
+        await self.app(scope, wrapped_receive, wrapped_send)
 
         # 6) 提取账号（由 determine_mode_and_token 注入到 request.state，通过 scope["state"]）
         account_id = ""
         try:
-            # ASGI 中 request.state 通过 scope["state"] 传递
             state = scope.get("state", {})
             acc = state.get("account")
             if acc and isinstance(acc, dict):
@@ -265,19 +260,40 @@ class StatsASGIMiddleware:
         except Exception:
             pass
 
-        # 7) 非流式响应提取精确 token
+        # 7) 从响应体中解析 token 用量
         completion = 0
         total = prompt_est
-        if capture_response and captured_body:
-            try:
-                resp_data = json.loads(bytes(captured_body))
-                usage = resp_data.get("usage", {})
-                if usage:
-                    prompt_est = usage.get("prompt_tokens", prompt_est)
-                    completion = usage.get("completion_tokens", 0)
-                    total = usage.get("total_tokens", prompt_est + completion)
-            except Exception:
-                pass
+        if response_body:
+            body_text = bytes(response_body).decode("utf-8", errors="replace")
+
+            if stream:
+                # SSE 流式：逐行查找包含 "usage" 的 data: 行
+                for line in body_text.split("\n"):
+                    line = line.strip()
+                    if line.startswith("data:") and '"usage"' in line:
+                        try:
+                            data_str = line[5:].strip()
+                            if data_str == "[DONE]":
+                                continue
+                            chunk = json.loads(data_str)
+                            usage = chunk.get("usage", {})
+                            if usage:
+                                prompt_est = usage.get("prompt_tokens", prompt_est)
+                                completion = usage.get("completion_tokens", 0)
+                                total = usage.get("total_tokens", prompt_est + completion)
+                        except Exception:
+                            pass
+            else:
+                # 非流式：直接解析 JSON
+                try:
+                    resp_data = json.loads(body_text)
+                    usage = resp_data.get("usage", {})
+                    if usage:
+                        prompt_est = usage.get("prompt_tokens", prompt_est)
+                        completion = usage.get("completion_tokens", 0)
+                        total = usage.get("total_tokens", prompt_est + completion)
+                except Exception:
+                    pass
 
         # 8) 写入统计
         try:
