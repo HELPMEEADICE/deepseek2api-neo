@@ -1,6 +1,6 @@
-fastapi
-uvicorn
-curl_cffi
-transformers
-wasmtime
-jinja2
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+curl_cffi>=0.5.0
+transformers>=4.30.0
+wasmtime>=14.0.0
+tiktoken>=0.7.0

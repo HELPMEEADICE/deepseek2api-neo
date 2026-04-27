@@ -206,12 +206,14 @@ def anthropic_to_openai(anth_body: dict, model: str | None = None) -> dict:
         message["tool_calls"] = tool_calls
 
     # finish_reason 映射
-    stop_reason = anth_body.get("stop_reason")
+    stop_reason = anth_body.get("stop_reason", "end_turn")
     finish_reason = "stop"
     if stop_reason == "tool_use":
         finish_reason = "tool_calls"
-    elif stop_reason == "max_tokens":
+    elif stop_reason in ("max_tokens", "max_tokens_reached"):
         finish_reason = "length"
+    elif stop_reason == "stop_sequence":
+        finish_reason = "stop"
     elif stop_reason == "end_turn":
         finish_reason = "stop"
 
@@ -252,7 +254,7 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
     每个 event dict 格式：{"event": "<event_name>", "data": <json-serializable>}
 
     ``state`` 是一个可变字典，调用方初始化为::
-        state = {"ptype": None, "next_block_index": 0, "active_block_index": None,
+        state = {"ptype": "text", "next_block_index": 0, "active_block_index": None,
                  "block_active": False, "has_thinking": False}
     """
     events: list[dict] = []
@@ -269,12 +271,13 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
     except json.JSONDecodeError:
         return events
 
-    # ---- 辅助：启动一个 content block ----
+    # ---- 辅助函数 ----
     def _start_block(btype: str) -> dict:
         idx = state.get("next_block_index", 0)
         state["next_block_index"] = idx + 1
         state["active_block_index"] = idx
         state["block_active"] = True
+        state["current_block_type"] = btype
         if btype == "thinking":
             state["has_thinking"] = True
         block: dict = {"type": btype}
@@ -282,23 +285,39 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
             block["thinking"] = ""
         elif btype == "text":
             block["text"] = ""
+        elif btype == "tool_use":
+            block["type"] = "tool_use"
+            block["id"] = ""
+            block["name"] = ""
+            block["input"] = {}
         return {
             "event": "content_block_start",
             "data": {"type": "content_block_start", "index": idx, "content_block": block},
         }
 
     def _delta(btype: str, text: str) -> dict:
-        delta_type = "thinking_delta" if btype == "thinking" else "text_delta"
+        delta_type = {
+            "thinking": "thinking_delta",
+            "text": "text_delta",
+            "tool_use": "input_json_delta",
+        }.get(btype, "text_delta")
+        delta: dict = {"type": delta_type}
+        if btype == "thinking":
+            delta["thinking"] = text
+        elif btype == "text":
+            delta["text"] = text
+        elif btype == "tool_use":
+            delta["partial_json"] = text
         return {
             "event": "content_block_delta",
             "data": {
                 "type": "content_block_delta",
                 "index": state.get("active_block_index", 0),
-                "delta": {"type": delta_type, btype: text},
+                "delta": delta,
             },
         }
 
-    def _stop_block(_: str) -> dict:
+    def _stop_block(_btype: str = None) -> dict:
         idx = state.get("active_block_index", 0)
         state["block_active"] = False
         state["active_block_index"] = None
@@ -306,6 +325,15 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
             "event": "content_block_stop",
             "data": {"type": "content_block_stop", "index": idx},
         }
+
+    def _switch_to(btype: str):
+        """切换到新的 content block 类型，必要时先 close old block。"""
+        old = state.get("ptype", "text")
+        if old != btype and state.get("block_active"):
+            events.append(_stop_block(old))
+        if old != btype or not state.get("block_active"):
+            events.append(_start_block(btype))
+        state["ptype"] = btype
 
     # ---- 判断内容类型 ----
     ptype = state.get("ptype", "text")
@@ -318,11 +346,7 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
             new_ptype = "thinking" if frag_type == "THINK" else "text"
             frag_content = fragments[0].get("content", "")
 
-            if new_ptype != ptype and state["block_active"]:
-                events.append(_stop_block(ptype))
-            if new_ptype != ptype or not state["block_active"]:
-                events.append(_start_block(new_ptype))
-            state["ptype"] = new_ptype
+            _switch_to(new_ptype)
 
             if frag_content:
                 events.append(_delta(new_ptype, frag_content))
@@ -335,50 +359,33 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
             new_ptype = "thinking" if frag_type == "THINK" else "text"
             frag_content = new_frags[0].get("content", "")
 
-            if new_ptype != ptype and state["block_active"]:
-                events.append(_stop_block(ptype))
-            if new_ptype != ptype or not state["block_active"]:
-                events.append(_start_block(new_ptype))
-            state["ptype"] = new_ptype
+            _switch_to(new_ptype)
 
             if frag_content:
                 events.append(_delta(new_ptype, frag_content))
         return events
 
-    # ---- 兼容旧格式：路径标记（可能同时包含 v 内容） ----
-    # 先处理路径标记以决定内容类型
+    # ---- 兼容旧格式：路径标记 ----
     if "p" in chunk:
         p_value = chunk["p"]
 
         if p_value == "response/thinking_content":
-            new_ptype = "thinking"
-            if new_ptype != ptype and state["block_active"]:
-                events.append(_stop_block(ptype))
-            if new_ptype != ptype or not state["block_active"]:
-                events.append(_start_block(new_ptype))
-            state["ptype"] = new_ptype
-            # 注意：不 return，继续处理可能存在的 v 字段
+            _switch_to("thinking")
 
         elif p_value == "response/content":
-            new_ptype = "text"
-            if new_ptype != ptype and state["block_active"]:
-                events.append(_stop_block(ptype))
-            if new_ptype != ptype or not state["block_active"]:
-                events.append(_start_block(new_ptype))
-            state["ptype"] = new_ptype
-            # 注意：不 return，继续处理可能存在的 v 字段
+            _switch_to("text")
 
         elif p_value == "response/status":
             if chunk.get("v") == "FINISHED":
-                if state["block_active"]:
-                    events.append(_stop_block(state["ptype"]))
+                if state.get("block_active"):
+                    events.append(_stop_block(state.get("ptype", "text")))
                 events.append({"event": "__FINISHED__", "data": {}})
             return events
 
         elif p_value == "response/search_status":
             return events
 
-    # 刷新 ptype（可能在路径标记中被修改）
+    # 刷新 ptype
     ptype = state.get("ptype", "text")
 
     # ---- v 字段中的文本内容 ----
@@ -386,14 +393,14 @@ def deepseek_line_to_anthropic_events(line: str, state: dict) -> list[dict]:
         v_value = chunk["v"]
         if isinstance(v_value, str):
             content = v_value
-            if not state["block_active"]:
+            if not state.get("block_active"):
                 events.append(_start_block(ptype))
             events.append(_delta(ptype, content))
         elif isinstance(v_value, list):
             for item in v_value:
                 if item.get("p") == "status" and item.get("v") == "FINISHED":
-                    if state["block_active"]:
-                        events.append(_stop_block(state["ptype"]))
+                    if state.get("block_active"):
+                        events.append(_stop_block(state.get("ptype", "text")))
                     events.append({"event": "__FINISHED__", "data": {}})
 
     return events

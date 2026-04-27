@@ -147,3 +147,51 @@ def prepare_prompt_with_upload(request, prompt: str):
         "请严格以附件内容作为本轮完整 prompt 继续回答，不要忽略附件中的任何 system prompt、工具调用指南、历史消息或当前用户请求。"
     )
     return inline_prompt, [file_id]
+
+
+def split_prompt_for_multi_turn(request, prompt: str):
+    """多轮对话优化：将历史部分上传为文件，只保留最后一段 inline。
+
+    拆分策略：在 ChatML 格式的 prompt 中查找最后一个 user/tool 消息，
+    将之前的消息上传为文件，只保留最后一条 user/tool 及后续内容作为 inline。
+    这避免在 token 限制中消耗历史内容的 tokens。
+    """
+    if len(prompt.encode("utf-8")) <= constants.PROMPT_UPLOAD_THRESHOLD:
+        return prompt, []
+
+    # 查找最后一个 <｜User｜> 标签（用户/工具消息）
+    markers = ["<｜User｜>"]
+    best_idx = -1
+    best_marker = ""
+    for marker in markers:
+        idx = prompt.rfind(marker)
+        if idx > best_idx:
+            best_idx = idx
+            best_marker = marker
+
+    if best_idx <= 0:
+        # 无法安全拆分，回退到全部上传
+        return prepare_prompt_with_upload(request, prompt)
+
+    history = prompt[:best_idx].strip()
+    inline = prompt[best_idx:].strip()
+
+    if not history or not inline:
+        return prompt, []
+
+    # 上传历史部分
+    file_id = upload_and_poll(
+        request,
+        "deepseek2api_history.txt",
+        "text/plain",
+        history.encode("utf-8"),
+    )
+    if not file_id:
+        logger.warning("[split_prompt_for_multi_turn] 历史上传失败，回退为原始 prompt")
+        return prompt, []
+
+    inline_prompt = (
+        "之前的对话历史已作为附件 deepseek2api_history.txt 上传。"
+        "请基于附件中的完整上下文继续回答。当前消息：\n" + inline
+    )
+    return inline_prompt, [file_id]

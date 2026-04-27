@@ -5,56 +5,43 @@ from curl_cffi import requests
 from fastapi import HTTPException, Request
 
 from . import config, constants, session as session_module
+from .pool import account_pool
 
 logger = logging.getLogger(__name__)
 
-# -------------------------- 全局账号队列 --------------------------
-account_queue = []  # 维护所有可用账号
-
-
+# ----------------------------------------------------------------------
+# 初始化账号池
+# ----------------------------------------------------------------------
 def init_account_queue():
-    """初始化时从配置加载账号"""
-    global account_queue
-    account_queue = config.CONFIG.get("accounts", [])[:]  # 深拷贝
-    random.shuffle(account_queue)  # 初始随机排序
-
-
-init_account_queue()
+    """初始化时从配置加载账号并填入账号池。"""
+    accounts = config.CONFIG.get("accounts", [])[:]
+    random.shuffle(accounts)
+    account_pool.load(accounts)
 
 
 def choose_new_account(exclude_ids=None):
-    """选择策略：
-    1. 遍历队列，找到第一个未被 exclude_ids 包含的账号
-    2. 从队列中移除该账号
-    3. 返回该账号（由后续逻辑保证最终会重新入队）
-    """
-    if exclude_ids is None:
-        exclude_ids = []
-
-    for i in range(len(account_queue)):
-        acc = account_queue[i]
-        acc_id = constants.get_account_identifier(acc)
-        if acc_id and acc_id not in exclude_ids:
-            logger.info(f"[choose_new_account] 新选择账号: {acc_id}")
-            return account_queue.pop(i)
-
-    logger.warning("[choose_new_account] 没有可用的账号或所有账号都在使用中")
-    return None
+    """兼容旧接口 —— 从池中获取一个账号（不自动释放）。"""
+    account, _guard = account_pool.acquire(exclude_ids)
+    if account:
+        # 把 guard 存到 account 上，由 release_account 负责释放
+        account["_guard"] = _guard
+    return account
 
 
 def release_account(account):
-    """将账号重新加入队列末尾"""
-    account_queue.append(account)
+    """兼容旧接口 —— 释放账号。如果已通过 _guard 释放则忽略。"""
+    if account is None:
+        return
+    guard = account.get("_guard")
+    if guard:
+        guard.__exit__(None, None, None)
+        account["_guard"] = None
 
 
 # ----------------------------------------------------------------------
-# 登录函数：支持使用 email 或 mobile 登录
+# 登录函数
 # ----------------------------------------------------------------------
 def login_deepseek_via_account(account):
-    """使用 account 中的 email 或 mobile 登录 DeepSeek，
-    成功后将返回的 token 写入 account 并保存至配置文件，返回新 token。
-    同时初始化 Session 并获取 HIF 令牌。
-    """
     email = account.get("email", "").strip()
     mobile = account.get("mobile", "").strip()
     password = account.get("password", "").strip()
@@ -64,7 +51,6 @@ def login_deepseek_via_account(account):
             detail="账号缺少必要的登录信息（必须提供 email 或 mobile 以及 password）",
         )
 
-    # 初始化 Session（先访问主页初始化 Cookie）
     session = session_module.get_account_session(account)
 
     if email:
@@ -83,20 +69,23 @@ def login_deepseek_via_account(account):
             "os": "android",
         }
     try:
-        resp = session.post(constants.DEEPSEEK_LOGIN_URL, headers=constants.BASE_HEADERS, json=payload, impersonate="safari15_3")
+        resp = session.post(
+            constants.DEEPSEEK_LOGIN_URL,
+            headers=constants.BASE_HEADERS,
+            json=payload,
+            impersonate="safari15_3",
+        )
         resp.raise_for_status()
     except Exception as e:
         logger.error(f"[login_deepseek_via_account] 登录请求异常: {e}")
         raise HTTPException(status_code=500, detail="Account login failed: 请求异常")
     try:
-        logger.warning(f"[login_deepseek_via_account] {resp.text}")
         data = resp.json()
     except Exception as e:
         logger.error(f"[login_deepseek_via_account] JSON解析失败: {e}")
         raise HTTPException(
             status_code=500, detail="Account login failed: invalid JSON response"
         )
-    # 校验响应数据格式是否正确
     if (
         data.get("data") is None
         or data["data"].get("biz_data") is None
@@ -115,7 +104,6 @@ def login_deepseek_via_account(account):
     account["token"] = new_token
     config.save_config(config.CONFIG)
 
-    # 登录成功后获取 HIF 令牌
     ensure_hif_tokens(account, force=True)
 
     return new_token
@@ -125,7 +113,6 @@ def login_deepseek_via_account(account):
 # HIF 令牌获取
 # ----------------------------------------------------------------------
 def fetch_hif_token(session, url, token_name):
-    """从 HIF 端点获取令牌，返回 token 字符串或 None"""
     try:
         resp = session.get(
             url,
@@ -153,7 +140,6 @@ def fetch_hif_token(session, url, token_name):
 
 
 def ensure_hif_tokens(account, force=False):
-    """确保账号有 HIF 令牌，缺失（或强制）时从 HIF 端点重新获取"""
     if not force and account.get("hif_dliq") and account.get("hif_leim"):
         return True
 
@@ -182,27 +168,11 @@ def ensure_hif_tokens(account, force=False):
 # 判断调用模式：配置模式 vs 用户自带 token
 # ----------------------------------------------------------------------
 def determine_mode_and_token(request: Request, allow_x_api_key: bool = False):
-    """
-    根据请求头判断使用哪种模式：
-
-    认证头优先级（按顺序检测）：
-    1. ``Authorization: Bearer <key>``（标准 OpenAI / 通用格式）
-    2. ``x-api-key``（仅当 ``allow_x_api_key=True`` 时，兼容 Anthropic SDK）
-
-    如果 Bearer token 出现在 CONFIG["keys"] 中，则为配置模式，从 CONFIG["accounts"]
-    中随机选择一个账号（排除已尝试账号），检查该账号是否已有 token，否则调用登录接口获取；
-    否则，直接使用请求中的 Bearer / x-api-key 值作为 DeepSeek token。
-
-    结果存入 request.state.deepseek_token；配置模式下同时存入
-    request.state.account 与 request.state.tried_accounts。
-    """
     auth_header = request.headers.get("Authorization", "")
 
-    # 优先使用 Authorization: Bearer
     if auth_header.startswith("Bearer "):
         caller_key = auth_header.replace("Bearer ", "", 1).strip()
     elif allow_x_api_key:
-        # Anthropic SDK 兼容：回退到 x-api-key 头
         x_key = request.headers.get("x-api-key", "")
         if x_key:
             caller_key = x_key.strip()
@@ -218,7 +188,7 @@ def determine_mode_and_token(request: Request, allow_x_api_key: bool = False):
     config_keys = config.CONFIG.get("keys", [])
     if caller_key in config_keys:
         request.state.use_config_token = True
-        request.state.tried_accounts = []  # 初始化已尝试账号
+        request.state.tried_accounts = []
         selected_account = choose_new_account()
         if not selected_account:
             raise HTTPException(
@@ -233,9 +203,9 @@ def determine_mode_and_token(request: Request, allow_x_api_key: bool = False):
                 logger.error(
                     f"[determine_mode_and_token] 账号 {constants.get_account_identifier(selected_account)} 登录失败：{e}"
                 )
+                release_account(selected_account)
                 raise HTTPException(status_code=500, detail="Account login failed.")
         else:
-            # 已有 token 但可能缺少 HIF 令牌，确保获取
             ensure_hif_tokens(selected_account)
 
         request.state.deepseek_token = selected_account.get("token")
@@ -247,12 +217,10 @@ def determine_mode_and_token(request: Request, allow_x_api_key: bool = False):
 
 
 def get_auth_headers(request: Request):
-    """返回 DeepSeek 请求所需的公共请求头"""
     return {**constants.BASE_HEADERS, "authorization": f"Bearer {request.state.deepseek_token}"}
 
 
 def get_hif_headers(request: Request):
-    """返回 HIF (x-hif-dliq / x-hif-leim) 认证头"""
     headers = {}
     account = getattr(request.state, "account", None)
     if account:
@@ -261,3 +229,157 @@ def get_hif_headers(request: Request):
         if account.get("hif_leim"):
             headers["x-hif-leim"] = account["hif_leim"]
     return headers
+
+
+# ----------------------------------------------------------------------
+# 账号健康检查（启动时）
+# ----------------------------------------------------------------------
+def account_health_check(account, timeout=30):
+    """对单个账号执行健康检查：登录 → 创建会话 → PoW → 发一条 mini completion 并消费完 stream → 删除会话。
+
+    成功返回 True，失败返回 False。
+    """
+    from .chat import create_session, messages_prepare, call_completion_endpoint
+    from .pow import get_pow_response
+    import time as _time
+
+    acc_id = constants.get_account_identifier(account)
+    logger.info(f"[health_check] 开始健康检查账号: {acc_id}")
+
+    try:
+        # 1. 登录
+        if not account.get("token"):
+            login_deepseek_via_account(account)
+        else:
+            ensure_hif_tokens(account)
+
+        # 2. 创建会话 —— 需要伪造一个 request 对象
+        class _FakeRequest:
+            class state:
+                deepseek_token = account.get("token")
+                account = account
+                use_config_token = True
+        fake_req = _FakeRequest()
+
+        session_id = create_session(fake_req)
+        if not session_id:
+            logger.warning(f"[health_check] {acc_id} 创建会话失败")
+            return False
+
+        # 3. 获取 PoW
+        pow_resp = get_pow_response(fake_req)
+        if not pow_resp:
+            logger.warning(f"[health_check] {acc_id} 获取 PoW 失败")
+            _delete_session_for_health(account, session_id, fake_req)
+            return False
+
+        # 4. 发送一条 mini completion
+        test_prompt = messages_prepare([{"role": "user", "content": "Hello, world!"}])
+        headers = {
+            **get_auth_headers(fake_req),
+            **get_hif_headers(fake_req),
+            "x-ds-pow-response": pow_resp,
+        }
+        payload = {
+            "chat_session_id": session_id,
+            "parent_message_id": None,
+            "model_type": "default",
+            "prompt": test_prompt,
+            "ref_file_ids": [],
+            "thinking_enabled": True,
+            "search_enabled": False,
+            "preempt": False,
+        }
+
+        ds_session = session_module.get_account_session(account)
+        resp = call_completion_endpoint(payload, headers, ds_session, max_attempts=2)
+        if not resp or resp.status_code != 200:
+            logger.warning(f"[health_check] {acc_id} completion 请求失败")
+            _delete_session_for_health(account, session_id, fake_req)
+            if resp:
+                resp.close()
+            return False
+
+        # 5. 消费 stream 直到结束
+        try:
+            for raw_line in resp.iter_lines():
+                pass  # 只需要确认能收到数据
+        except Exception as e:
+            logger.warning(f"[health_check] {acc_id} stream 消费异常: {e}")
+        finally:
+            resp.close()
+
+        # 6. 删除会话
+        _delete_session_for_health(account, session_id, fake_req)
+
+        logger.info(f"[health_check] {acc_id} 健康检查通过")
+        return True
+
+    except Exception as e:
+        logger.warning(f"[health_check] {acc_id} 健康检查异常: {e}")
+        return False
+
+
+def _delete_session_for_health(account, session_id, fake_req):
+    try:
+        headers = {
+            **constants.BASE_HEADERS,
+            "authorization": f"Bearer {account.get('token')}",
+        }
+        ds_session = session_module.get_account_session(account)
+        resp = ds_session.post(
+            constants.DEEPSEEK_DELETE_SESSION_URL,
+            headers=headers,
+            json={"chat_session_id": session_id},
+            impersonate="safari15_3",
+            timeout=5,
+        )
+        resp.close()
+    except Exception:
+        pass
+
+
+def run_health_checks(max_concurrent=10):
+    """启动时并发执行所有账号的健康检查，丢弃不健康的账号。"""
+    import threading
+
+    all_accounts = account_pool.all_accounts()
+    if not all_accounts:
+        logger.warning("[health_check] 没有可用的账号")
+        return
+
+    semaphore = threading.Semaphore(max_concurrent)
+    failed = []
+    passed = []
+
+    def check_one(acct):
+        semaphore.acquire()
+        try:
+            if account_health_check(acct):
+                passed.append(acct)
+            else:
+                failed.append(acct)
+        finally:
+            semaphore.release()
+
+    threads = []
+    for acct in all_accounts:
+        t = threading.Thread(target=check_one, args=(acct,))
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    # 用健康的账号重建池
+    if passed:
+        account_pool.load(passed)
+        logger.info(f"[health_check] {len(passed)} 个账号通过健康检查")
+    if failed:
+        logger.warning(f"[health_check] {len(failed)} 个账号未通过健康检查: "
+                       f"{[constants.get_account_identifier(a) for a in failed]}")
+
+    # 如果所有账号都失败，仍然保留原始配置（降级运行）
+    if not passed:
+        logger.error("[health_check] 所有账号均未通过健康检查，降级使用原始配置")
+        account_pool.load(all_accounts)

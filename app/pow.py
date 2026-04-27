@@ -8,7 +8,7 @@ import time
 from wasmtime import Linker, Module, Store
 
 from . import constants, session as session_module
-from .account import choose_new_account, login_deepseek_via_account
+from .account import choose_new_account, login_deepseek_via_account, release_account
 from .constants import get_account_identifier
 
 logger = logging.getLogger(__name__)
@@ -110,8 +110,9 @@ def compute_pow_answer(
 # ----------------------------------------------------------------------
 # 获取 PoW 响应，融合计算 answer 逻辑
 # ----------------------------------------------------------------------
-def get_pow_response(request, max_attempts=3, target_path="/api/v0/chat/completion"):
+def get_pow_response(request, max_attempts=6, target_path="/api/v0/chat/completion"):
     attempts = 0
+    RETRY_DELAYS = [1, 2, 4, 8, 16, 32]
     while attempts < max_attempts:
         headers = {
             **constants.BASE_HEADERS,
@@ -127,7 +128,9 @@ def get_pow_response(request, max_attempts=3, target_path="/api/v0/chat/completi
                 impersonate="safari15_3",
             )
         except Exception as e:
-            logger.error(f"[get_pow_response] 请求异常: {e}")
+            wait = RETRY_DELAYS[min(attempts, len(RETRY_DELAYS) - 1)]
+            logger.error(f"[get_pow_response] 请求异常 (尝试 {attempts + 1}/{max_attempts}): {e}, 等待 {wait}s")
+            time.sleep(wait)
             attempts += 1
             continue
         try:
@@ -185,6 +188,7 @@ def get_pow_response(request, max_attempts=3, target_path="/api/v0/chat/completi
                     request.state.tried_accounts = []
                 if current_id not in request.state.tried_accounts:
                     request.state.tried_accounts.append(current_id)
+                release_account(request.state.account)
                 new_account = choose_new_account(request.state.tried_accounts)
                 if new_account is None:
                     break
@@ -194,6 +198,7 @@ def get_pow_response(request, max_attempts=3, target_path="/api/v0/chat/completi
                     logger.error(
                         f"[get_pow_response] 账号 {get_account_identifier(new_account)} 登录失败：{e}"
                     )
+                    release_account(new_account)
                     attempts += 1
                     continue
                 request.state.account = new_account

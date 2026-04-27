@@ -24,176 +24,12 @@ from .converter import (
 )
 from .files import prepare_prompt_with_upload
 from .pow import get_pow_response
+from .sse_utils import BufferedResponse, OverloadedError, check_hint_events
+from .tokens import count_tokens
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-def _decode_json_string_prefix(raw: str) -> str:
-    chars = []
-    i = 0
-    while i < len(raw):
-        ch = raw[i]
-        if ch == '"':
-            break
-        if ch == "\\":
-            if i + 1 >= len(raw):
-                break
-            nxt = raw[i + 1]
-            mapping = {
-                '"': '"', "\\": "\\", "/": "/",
-                "b": "\b", "f": "\f", "n": "\n",
-                "r": "\r", "t": "\t",
-            }
-            if nxt == "u":
-                if i + 6 > len(raw):
-                    break
-                try:
-                    chars.append(chr(int(raw[i + 2:i + 6], 16)))
-                    i += 6
-                    continue
-                except ValueError:
-                    chars.append(nxt)
-            else:
-                chars.append(mapping.get(nxt, nxt))
-            i += 2
-            continue
-        chars.append(ch)
-        i += 1
-    return "".join(chars)
-
-
-def _balanced_json_prefix(raw: str) -> str:
-    in_string = False
-    escape = False
-    stack = []
-    started = False
-    start = 0
-    for idx, ch in enumerate(raw):
-        if not started:
-            if ch.isspace():
-                continue
-            if ch not in "[{":
-                return ""
-            start = idx
-            stack = ["}" if ch == "{" else "]"]
-            started = True
-            continue
-
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_string = False
-            continue
-
-        if ch == '"':
-            in_string = True
-        elif ch in "[{":
-            stack.append("}" if ch == "{" else "]")
-        elif ch in "}]":
-            if not stack or ch != stack[-1]:
-                return ""
-            stack.pop()
-            if not stack:
-                return raw[start:idx + 1]
-    return ""
-
-
-def _extract_stream_tool_meta(text: str):
-    call_id = None
-    name = None
-    id_match = re.search(r'"id"\s*:\s*"([^"]+)"', text)
-    if id_match:
-        call_id = id_match.group(1)
-    name_match = re.search(r'"name"\s*:\s*"([^"]+)"', text)
-    if name_match:
-        name = name_match.group(1)
-    if not name:
-        xml_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', text, re.I)
-        if xml_match:
-            name = xml_match.group(1)
-    if not name:
-        attr_match = re.search(r'\bfunction=["\'](?:name\s+)?([^"\'\s>]+)', text, re.I)
-        if attr_match:
-            name = attr_match.group(1)
-    if not name:
-        fc_match = re.search(r'<function_calls>\s*([^\s<]+)', text, re.I)
-        if fc_match:
-            name = fc_match.group(1)
-    if not name:
-        invoke_match = re.search(r'<invoke\s+name=["\']([^"\']+)["\']', text, re.I)
-        if invoke_match:
-            name = invoke_match.group(1)
-    return call_id, name
-
-
-def _extract_stream_arguments(text: str) -> str:
-    match = re.search(r'"arguments"\s*:\s*', text)
-    if match:
-        raw = text[match.end():]
-        stripped = raw.lstrip()
-        if stripped.startswith('"'):
-            return _decode_json_string_prefix(stripped[1:])
-        json_prefix = _balanced_json_prefix(stripped)
-        if json_prefix:
-            return json_prefix
-        return stripped
-
-    xml_match = re.search(r'<tool_call\s+name=["\'][^"\']+["\']\s*>', text, re.I)
-    if xml_match:
-        value = text[xml_match.end():]
-        end = re.search(r'</tool_call>', value, re.I)
-        return value[:end.start()] if end else value
-
-    attr_match = re.search(r'\barguments=["\']', text, re.I)
-    if attr_match:
-        return _decode_json_string_prefix(text[attr_match.end():])
-
-    fc_match = re.search(r'<function_calls>\s*[^\s<]+\s+(.*)', text, re.I | re.DOTALL)
-    if fc_match:
-        value = fc_match.group(1)
-        end = re.search(r'\n\s*[^\s<{]+\s*\n\s*[{\[]|</function_calls>', value, re.I)
-        if end:
-            value = value[:end.start()]
-        return value.strip()
-
-    invoke_match = re.search(r'<invoke\s+name=["\'][^"\']+["\']\s*>\s*(.*)', text, re.I | re.DOTALL)
-    if invoke_match:
-        body = invoke_match.group(1)
-        end = re.search(r'</invoke>', body, re.I)
-        if end:
-            body = body[:end.start()]
-        args = {}
-        param_pattern = re.compile(
-            r'<parameter\s+name=["\']([^"\']+)["\'][^>]*>\s*(.*?)\s*(?:</parameter>|$)',
-            re.I | re.DOTALL,
-        )
-        for param in param_pattern.finditer(body):
-            args[param.group(1)] = param.group(2).strip()
-        if args:
-            return json.dumps(args, ensure_ascii=False)
-        return body.strip()
-    return ""
-
-
-TOOL_ARGUMENT_STREAM_CHUNK_SIZE = 24
-TOOL_ARGUMENT_STREAM_DELAY = 0.015
-TOOL_MARKER_LOOKBEHIND = 64
-
-
-def _iter_text_chunks(text: str, size: int = TOOL_ARGUMENT_STREAM_CHUNK_SIZE):
-    for start in range(0, len(text), size):
-        yield text[start:start + size]
-
-
-def _split_safe_text_for_tool_detection(text: str, force: bool = False):
-    if force or len(text) <= TOOL_MARKER_LOOKBEHIND:
-        return (text, "") if force else ("", text)
-    return text[:-TOOL_MARKER_LOOKBEHIND], text[-TOOL_MARKER_LOOKBEHIND:]
 
 
 # ----------------------------------------------------------------------
@@ -401,7 +237,7 @@ After calling tools, you will receive the results and can continue the conversat
             "preempt": False,
         }
 
-        deepseek_resp = chat.call_completion_endpoint(payload, headers, session_module.get_request_session(request), max_attempts=3)
+        deepseek_resp = chat.call_completion_endpoint(payload, headers, session_module.get_request_session(request))
         if not deepseek_resp:
             raise HTTPException(status_code=500, detail="Failed to get completion.")
         created_time = int(time.time())
@@ -415,21 +251,32 @@ After calling tools, you will receive the results and can continue the conversat
                     content=deepseek_resp.content, status_code=deepseek_resp.status_code
                 )
 
+            # ---------- Hint 事件前置检测 ----------
+            try:
+                deepseek_resp = check_hint_events(deepseek_resp)
+            except OverloadedError:
+                deepseek_resp.close()
+                _delete_deepseek_session(request, session_id)
+                if getattr(request.state, "use_config_token", False) and hasattr(request.state, "account"):
+                    release_account(request.state.account)
+                raise HTTPException(status_code=429, detail="Server overloaded. Please retry.")
+
             def sse_stream():
                 client_disconnected = False
-                stream_completed = False  # 标记流是否正常完成
+                stream_completed = False
                 try:
                     final_text = ""
                     final_thinking = ""
                     first_chunk_sent = False
-                    tool_call_buffering = False
-                    tool_stream_started = False
-                    tool_stream_arg_sent = 0
-                    tool_stream_id = "call_001"
-                    tool_stream_name = ""
-                    tool_stream_buffer = ""
-                    pending_tool_scan_text = ""
+                    has_tools = bool(tools_requested)
+
+                    # 工具调用流式检测器
+                    detector = chat.ToolCallStreamDetector()
+
+                    # 基于 Event 的线程通信（消除 queue 轮询）
                     result_queue = queue.Queue()
+                    data_event = threading.Event()
+
                     last_send_time = time.time()
 
                     def process_data():
@@ -438,45 +285,34 @@ After calling tools, you will receive the results and can continue the conversat
                             for raw_line in deepseek_resp.iter_lines():
                                 try:
                                     line = raw_line.decode("utf-8")
-                                except Exception as e:
-                                    logger.warning(f"[sse_stream] 解码失败: {e}")
-                                    error_type = "thinking" if current_ptype == "thinking" else "text"
-                                    busy_content_str = f'{{"choices":[{{"index":0,"delta":{{"content":"解码失败，请稍候再试","type":"{error_type}"}}}}],"model":"","chunk_token_usage":1,"created":0,"message_id":-1,"parent_id":-1}}'
-                                    try:
-                                        busy_content = json.loads(busy_content_str)
-                                        result_queue.put(busy_content)
-                                    except json.JSONDecodeError:
-                                        result_queue.put({"choices": [{"index": 0, "delta": {"content": "解码失败", "type": "text"}}]})
+                                except Exception:
+                                    logger.warning("[sse_stream] 解码失败")
                                     result_queue.put(None)
+                                    data_event.set()
                                     break
                                 if not line:
                                     continue
                                 if line.startswith("data:"):
                                     data_str = line[5:].strip()
                                     if data_str == "[DONE]":
-                                        result_queue.put(None)  # 结束信号
+                                        result_queue.put(None)
+                                        data_event.set()
                                         break
                                     try:
                                         chunk = json.loads(data_str)
 
-                                        # ---- 新格式：初始片段状态（v.response.fragments） ----
+                                        # 新格式：fragments
                                         if "v" in chunk and isinstance(chunk["v"], dict) and "response" in chunk["v"]:
                                             fragments = chunk["v"]["response"].get("fragments", [])
                                             if fragments and isinstance(fragments, list) and len(fragments) > 0:
                                                 frag_type = fragments[0].get("type", "")
                                                 current_ptype = "thinking" if frag_type == "THINK" else "text"
-                                                # 处理片段中的初始内容
                                                 frag_content = fragments[0].get("content", "")
                                                 if frag_content:
-                                                    unified_chunk = {
-                                                        "choices": [{"index": 0, "delta": {"content": frag_content, "type": current_ptype}}],
-                                                        "model": "", "chunk_token_usage": len(frag_content) // 4,
-                                                        "created": 0, "message_id": -1, "parent_id": -1,
-                                                    }
-                                                    result_queue.put(unified_chunk)
+                                                    result_queue.put(("content", current_ptype, frag_content))
+                                                    data_event.set()
                                             continue
 
-                                        # ---- 新格式：fragment 追加（THINK→RESPONSE 切换） ----
                                         if "p" in chunk and chunk.get("p") == "response/fragments" and chunk.get("o") == "APPEND":
                                             new_frags = chunk.get("v", [])
                                             if new_frags and isinstance(new_frags, list) and len(new_frags) > 0:
@@ -484,120 +320,95 @@ After calling tools, you will receive the results and can continue the conversat
                                                 current_ptype = "thinking" if frag_type == "THINK" else "text"
                                                 frag_content = new_frags[0].get("content", "")
                                                 if frag_content:
-                                                    unified_chunk = {
-                                                        "choices": [{"index": 0, "delta": {"content": frag_content, "type": current_ptype}}],
-                                                        "model": "", "chunk_token_usage": len(frag_content) // 4,
-                                                        "created": 0, "message_id": -1, "parent_id": -1,
-                                                    }
-                                                    result_queue.put(unified_chunk)
+                                                    result_queue.put(("content", current_ptype, frag_content))
+                                                    data_event.set()
                                             continue
 
-                                        # ---- 兼容旧格式：thinking_content / content 切换 ----
+                                        # 旧格式：路径标记
                                         if "p" in chunk and chunk.get("p") == "response/thinking_content":
                                             current_ptype = "thinking"
                                         elif "p" in chunk and chunk.get("p") == "response/content":
                                             current_ptype = "text"
 
-                                        # ---- status / search_status ----
                                         if "p" in chunk and chunk.get("p") == "response/status":
-                                            if chunk.get("v") == 'FINISHED':
+                                            if chunk.get("v") == "FINISHED":
                                                 result_queue.put(None)
+                                                data_event.set()
                                                 break
                                             continue
                                         if "p" in chunk and chunk.get("p") == "response/search_status":
                                             continue
 
-                                        # ---- 处理 v 字段 ----
+                                        # v 字段
                                         if "v" in chunk:
                                             v_value = chunk["v"]
-
                                             if isinstance(v_value, str):
-                                                content = v_value
+                                                result_queue.put(("content", current_ptype, v_value))
+                                                data_event.set()
                                             elif isinstance(v_value, list):
                                                 for item in v_value:
                                                     if item.get("p") == "status" and item.get("v") == "FINISHED":
-                                                        result_queue.put({"choices": [{"index": 0, "finish_reason": "stop"}]})
                                                         result_queue.put(None)
+                                                        data_event.set()
                                                         return
-                                                continue
-                                            else:
-                                                continue
-
-                                            unified_chunk = {
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {"content": content, "type": current_ptype}
-                                                }],
-                                                "model": "",
-                                                "chunk_token_usage": len(content) // 4,
-                                                "created": 0,
-                                                "message_id": -1,
-                                                "parent_id": -1,
-                                            }
-                                            result_queue.put(unified_chunk)
                                     except Exception as e:
-                                        logger.warning(f"[sse_stream] 无法解析: {data_str}, 错误: {e}")
-                                        error_type = "thinking" if current_ptype == "thinking" else "text"
-                                        busy_content_str = f'{{"choices":[{{"index":0,"delta":{{"content":"解析失败，请稍候再试","type":"{error_type}"}}}}],"model":"","chunk_token_usage":1,"created":0,"message_id":-1,"parent_id":-1}}'
-                                        try:
-                                            busy_content = json.loads(busy_content_str)
-                                            result_queue.put(busy_content)
-                                        except json.JSONDecodeError:
-                                            result_queue.put({"choices": [{"index": 0, "delta": {"content": "解析失败", "type": "text"}}]})
+                                        logger.warning(f"[sse_stream] 解析失败: {e}")
                                         result_queue.put(None)
+                                        data_event.set()
                                         break
                         except Exception as e:
-                            logger.warning(f"[sse_stream] 错误: {e}")
-                            try:
-                                error_response = {"choices": [{"index": 0, "delta": {"content": "服务器错误，请稍候再试", "type": "text"}}]}
-                                result_queue.put(error_response)
-                            except Exception:
-                                pass
+                            logger.warning(f"[sse_stream] 流错误: {e}")
                             result_queue.put(None)
+                            data_event.set()
                         finally:
                             deepseek_resp.close()
 
                     process_thread = threading.Thread(target=process_data)
                     process_thread.start()
 
-                    def _stream_tool_delta(tool_id=None, tool_name=None, arguments_part=None):
+                    def _emit_json(o: dict) -> str:
+                        return f"data: {json.dumps(o, ensure_ascii=False)}\n\n"
+
+                    def _emit_delta(delta: dict, finish_reason=None):
                         nonlocal first_chunk_sent, last_send_time
-                        delta_tool = {"index": 0}
-                        if tool_id is not None:
-                            delta_tool["id"] = tool_id
-                            delta_tool["type"] = "function"
-                        func_delta = {}
-                        if tool_name is not None:
-                            func_delta["name"] = tool_name
-                        if arguments_part is not None:
-                            func_delta["arguments"] = arguments_part
-                        if func_delta:
-                            delta_tool["function"] = func_delta
-
-                        delta_obj = {"tool_calls": [delta_tool]}
                         if not first_chunk_sent:
-                            delta_obj["role"] = "assistant"
+                            delta["role"] = "assistant"
                             first_chunk_sent = True
-
                         out = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
                             "created": created_time,
                             "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": delta_obj,
-                                "finish_reason": None,
-                            }],
+                            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
                         }
                         last_send_time = time.time()
-                        return f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+                        return _emit_json(out)
 
-                    def _stream_tool_arguments(arguments_part: str):
-                        for arg_part in _iter_text_chunks(arguments_part):
-                            yield _stream_tool_delta(arguments_part=arg_part)
-                            if TOOL_ARGUMENT_STREAM_DELAY:
-                                time.sleep(TOOL_ARGUMENT_STREAM_DELAY)
+                    # 流式发送工具调用的辅助函数
+                    def _stream_tool_call_events(tool_calls: list):
+                        nonlocal first_chunk_sent, last_send_time
+                        for ti, tc in enumerate(tool_calls):
+                            func = tc.get("function", {})
+                            name = func.get("name", "")
+                            args = func.get("arguments", "{}")
+                            tid = tc.get("id", f"call_{ti + 1:03d}")
+
+                            # 第一个 chunk: 发送 id, type, name
+                            yield _emit_delta({
+                                "tool_calls": [{
+                                    "index": ti,
+                                    "id": tid,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": ""},
+                                }]
+                            })
+                            # 后续 chunks: 流式发送 arguments
+                            yield _emit_delta({
+                                "tool_calls": [{
+                                    "index": ti,
+                                    "function": {"arguments": args},
+                                }]
+                            })
 
                     try:
                         while True:
@@ -605,267 +416,86 @@ After calling tools, you will receive the results and can continue the conversat
                             if current_time - last_send_time >= constants.KEEP_ALIVE_TIMEOUT:
                                 yield ": keep-alive\n\n"
                                 last_send_time = current_time
+
+                            # Event 等待替代轮询
+                            if not data_event.wait(timeout=min(constants.KEEP_ALIVE_TIMEOUT, 0.5)):
                                 continue
+                            data_event.clear()
+
                             try:
-                                chunk = result_queue.get(timeout=0.05)
+                                item = result_queue.get_nowait()
                             except queue.Empty:
                                 continue
 
-                            if chunk is None:
-                                # 检测 tool_calls（如果启用了 tools）
+                            if item is None:
+                                # 流结束
+                                # 1) 刷新检测器中的残余文本
+                                flush = detector.force_flush()
+                                if flush:
+                                    # 非工具调用时，输出剩余文本
+                                    if not detector.has_tool_start():
+                                        yield _emit_delta({"content": flush})
+
+                                # 2) 解析工具调用
                                 tool_calls_detected = None
-                                final_text_content = final_text
-                                parse_source = tool_stream_buffer or final_text
-                                tool_calls_detected, parsed_remaining = chat.detect_and_parse_tool_calls(parse_source)
-                                if tool_stream_buffer:
-                                    final_text_content = final_text
-                                    if not tool_calls_detected:
-                                        detected_name = tool_stream_name
-                                        args = _extract_stream_arguments(tool_stream_buffer)
-                                        if detected_name:
-                                            tool_calls_detected = [{
-                                                "id": tool_stream_id,
-                                                "type": "function",
-                                                "function": {
-                                                    "name": detected_name,
-                                                    "arguments": args or "{}",
-                                                },
-                                            }]
+                                if detector.has_tool_start():
+                                    collected = detector.collected
+                                    if collected:
+                                        parsed, _ = chat.detect_and_parse_tool_calls(collected)
+                                        if parsed:
+                                            tool_calls_detected = parsed
                                 else:
-                                    final_text_content = parsed_remaining
+                                    # 还在 detecting 状态 — 在完整文本上检测
+                                    parsed, remaining = chat.detect_and_parse_tool_calls(final_text)
+                                    if parsed:
+                                        tool_calls_detected = parsed
+                                        final_text = remaining
 
-                                if tool_calls_detected and final_text_content != final_text:
-                                    # Do not leak the raw JSON instruction payload as assistant text.
-                                    final_text = final_text_content
+                                # 3) 发送 tool_calls (如果未流式发送过)
+                                if tool_calls_detected:
+                                    yield from _stream_tool_call_events(tool_calls_detected)
 
-                                if pending_tool_scan_text and not tool_calls_detected:
-                                    safe_text, pending_tool_scan_text = _split_safe_text_for_tool_detection(
-                                        pending_tool_scan_text, force=True
-                                    )
-                                    text_delta = {"content": safe_text}
-                                    if not first_chunk_sent:
-                                        text_delta["role"] = "assistant"
-                                        first_chunk_sent = True
-                                    text_chunk = {
-                                        "id": completion_id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created_time,
-                                        "model": model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": text_delta,
-                                            "finish_reason": None,
-                                        }],
-                                    }
-                                    yield f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n"
-                                    last_send_time = current_time
-
-                                # 如果检测到 tool_calls，先发送 tool_calls chunk
-                                if tool_calls_detected and not tool_stream_started:
-                                    for tool_index, tool_call in enumerate(tool_calls_detected):
-                                        func = tool_call.get("function", {})
-                                        arguments = func.get("arguments", "{}")
-                                        delta_obj = {
-                                            "tool_calls": [{
-                                                "index": tool_index,
-                                                "id": tool_call.get("id", f"call_{tool_index + 1:03d}"),
-                                                "type": tool_call.get("type", "function"),
-                                                "function": {
-                                                    "name": func.get("name", ""),
-                                                    "arguments": "",
-                                                },
-                                            }]
-                                        }
-                                        if not first_chunk_sent:
-                                            delta_obj["role"] = "assistant"
-                                            first_chunk_sent = True
-                                        tool_call_chunk = {
-                                            "id": completion_id,
-                                            "object": "chat.completion.chunk",
-                                            "created": created_time,
-                                            "model": model,
-                                            "choices": [
-                                                {
-                                                    "index": 0,
-                                                    "delta": delta_obj,
-                                                    "finish_reason": None,
-                                                }
-                                            ],
-                                        }
-                                        yield f"data: {json.dumps(tool_call_chunk, ensure_ascii=False)}\n\n"
-                                        last_send_time = current_time
-
-                                        for arg_part in _iter_text_chunks(arguments):
-                                            arg_chunk = {
-                                                "id": completion_id,
-                                                "object": "chat.completion.chunk",
-                                                "created": created_time,
-                                                "model": model,
-                                                "choices": [{
-                                                    "index": 0,
-                                                    "delta": {
-                                                        "tool_calls": [{
-                                                            "index": tool_index,
-                                                            "function": {
-                                                                "arguments": arg_part,
-                                                            },
-                                                        }]
-                                                    },
-                                                    "finish_reason": None,
-                                                }],
-                                            }
-                                            yield f"data: {json.dumps(arg_chunk, ensure_ascii=False)}\n\n"
-                                            last_send_time = time.time()
-                                            if TOOL_ARGUMENT_STREAM_DELAY:
-                                                time.sleep(TOOL_ARGUMENT_STREAM_DELAY)
-
-                                # 发送最终统计信息
-                                prompt_tokens = len(final_prompt) // 4
-                                thinking_tokens = len(final_thinking) // 4
-                                completion_tokens = len(final_text) // 4
+                                # 4) 最终统计
                                 usage = {
-                                    "prompt_tokens": prompt_tokens,
-                                    "completion_tokens": thinking_tokens + completion_tokens,
-                                    "total_tokens": prompt_tokens + thinking_tokens + completion_tokens,
-                                    "completion_tokens_details": {
-                                        "reasoning_tokens": thinking_tokens
-                                    },
+                                    "prompt_tokens": count_tokens(final_prompt),
+                                    "completion_tokens": count_tokens(final_thinking) + count_tokens(final_text),
+                                    "total_tokens": count_tokens(final_prompt) + count_tokens(final_thinking) + count_tokens(final_text),
+                                    "completion_tokens_details": {"reasoning_tokens": count_tokens(final_thinking)},
                                 }
-
-                                # 根据是否有 tool_calls 设置 finish_reason
                                 finish_reason = "tool_calls" if tool_calls_detected else "stop"
-
-                                finish_chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": model,
-                                    "choices": [
-                                        {
-                                            "delta": {},
-                                            "index": 0,
-                                            "finish_reason": finish_reason,
-                                        }
-                                    ],
-                                    "usage": usage,
-                                }
-                                yield f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n"
-                                yield "data: [DONE]\n\n"
+                                yield _emit_delta({}, finish_reason=finish_reason)
+                                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}], 'usage': usage}, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
                                 stream_completed = True
-                                last_send_time = current_time
                                 break
-                            new_choices = []
-                            for choice in chunk.get("choices", []):
-                                delta = choice.get("delta", {})
-                                ctype = delta.get("type")
-                                ctext = delta.get("content", "")
-                                if (
-                                    choice
-                                    .get("finish_reason")
-                                    == "backend_busy"
-                                ):
-                                    ctext = '服务器繁忙，请稍候再试'
-                                if search_enabled and ctext.startswith("[citation:"):
-                                    ctext = ""
-                                if ctype == "thinking":
-                                    if thinking_enabled:
-                                        final_thinking += ctext
-                                elif ctype == "text":
-                                    final_text += ctext
 
-                                if ctype == "text" and has_tools and not tool_call_buffering:
-                                    tool_buffer_started_now = False
-                                    pending_tool_scan_text += ctext
-                                    stripped_text = chat.strip_partial_tool_call_text(pending_tool_scan_text)
-                                    if stripped_text != pending_tool_scan_text:
-                                        tool_call_buffering = True
-                                        tool_buffer_started_now = True
-                                        safe_text = stripped_text
-                                        if safe_text:
-                                            delta_obj = {"content": safe_text}
-                                            if not first_chunk_sent:
-                                                delta_obj["role"] = "assistant"
-                                                first_chunk_sent = True
-                                            new_choices.append({
-                                                "delta": delta_obj,
-                                                "index": choice.get("index", 0),
-                                            })
-                                        tool_stream_buffer = pending_tool_scan_text[len(stripped_text):]
-                                        final_text = final_text[:len(final_text) - len(pending_tool_scan_text)] + stripped_text
-                                        pending_tool_scan_text = ""
-                                    else:
-                                        safe_text, pending_tool_scan_text = _split_safe_text_for_tool_detection(
-                                            pending_tool_scan_text
-                                        )
-                                        if safe_text:
-                                            delta_obj = {"content": safe_text}
-                                            if not first_chunk_sent:
-                                                delta_obj["role"] = "assistant"
-                                                first_chunk_sent = True
-                                            new_choices.append({
-                                                "delta": delta_obj,
-                                                "index": choice.get("index", 0),
-                                            })
+                            # 处理中间内容块
+                            ctype, ptype, ctext = item
+
+                            if search_enabled and ctext.startswith("[citation:"):
+                                continue
+
+                            if ctype != "content":
+                                continue
+
+                            if ptype == "thinking":
+                                if thinking_enabled:
+                                    final_thinking += ctext
+                                    yield _emit_delta({"reasoning_content": ctext})
+                            elif ptype == "text":
+                                final_text += ctext
+
+                                if has_tools and detector.state == "detecting":
+                                    safe = detector.feed(ctext)
+                                    if safe:
+                                        yield _emit_delta({"content": safe})
+                                    # 如果进入了 collecting 状态，文本由 detector 缓冲
+                                elif detector.state == "collecting":
+                                    # 继续收集工具调用
+                                    detector.feed(ctext)
                                 else:
-                                    tool_buffer_started_now = False
+                                    yield _emit_delta({"content": ctext})
 
-                                if ctype == "text" and tool_call_buffering:
-                                    if not tool_buffer_started_now and ctext:
-                                        tool_stream_buffer += ctext
-                                    full_buffer = tool_stream_buffer
-                                    detected_id, detected_name = _extract_stream_tool_meta(full_buffer)
-                                    if detected_id:
-                                        tool_stream_id = detected_id
-                                    if detected_name:
-                                        tool_stream_name = detected_name
-                                    if tool_stream_name and not tool_stream_started:
-                                        tool_stream_started = True
-                                        yield _stream_tool_delta(
-                                            tool_id=tool_stream_id,
-                                            tool_name=tool_stream_name,
-                                            arguments_part="",
-                                        )
-                                    if tool_stream_started:
-                                        arg_stream = _extract_stream_arguments(full_buffer)
-                                        if len(arg_stream) > tool_stream_arg_sent:
-                                            arg_part = arg_stream[tool_stream_arg_sent:]
-                                            tool_stream_arg_sent = len(arg_stream)
-                                            if arg_part:
-                                                yield from _stream_tool_arguments(arg_part)
-
-                                # Tool-enabled text is emitted above after a small lookbehind so
-                                # partial tool-call markers do not leak to the client.
-                                if ctype == "text" and (has_tools or tool_call_buffering):
-                                    continue
-
-                                delta_obj = {}
-                                if not first_chunk_sent:
-                                    delta_obj["role"] = "assistant"
-                                    first_chunk_sent = True
-                                if ctype == "thinking":
-                                    if thinking_enabled:
-                                        delta_obj["reasoning_content"] = ctext
-                                elif ctype == "text":
-                                    delta_obj["content"] = ctext
-                                if delta_obj:
-                                    new_choices.append(
-                                        {
-                                            "delta": delta_obj,
-                                            "index": choice.get("index", 0),
-                                        }
-                                    )
-                            if new_choices:
-                                out_chunk = {
-                                    "id": completion_id,
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": model,
-                                    "choices": new_choices,
-                                }
-                                yield f"data: {json.dumps(out_chunk, ensure_ascii=False)}\n\n"
-                                last_send_time = current_time
                     except GeneratorExit:
-                        # 客户端主动断开连接（正常情况）
                         logger.info(f"[sse_stream] 客户端断开连接 session={session_id}")
                         client_disconnected = True
                         raise
@@ -874,10 +504,7 @@ After calling tools, you will receive the results and can continue the conversat
                     client_disconnected = True
                 finally:
                     _delete_deepseek_session(request, session_id)
-
-                    if getattr(request.state, "use_config_token", False) and hasattr(
-                        request.state, "account"
-                    ):
+                    if getattr(request.state, "use_config_token", False) and hasattr(request.state, "account"):
                         release_account(request.state.account)
 
             return StreamingResponse(
@@ -983,9 +610,9 @@ After calling tools, you will receive the results and can continue the conversat
                                                 # 检测 tool_calls
                                                 tool_calls_detected, final_content = chat.detect_and_parse_tool_calls(final_content)
 
-                                                prompt_tokens = len(final_prompt) // 4
-                                                reasoning_tokens = len(final_reasoning) // 4
-                                                completion_tokens = len(final_content) // 4
+                                                prompt_tokens = count_tokens(final_prompt)
+                                                reasoning_tokens = count_tokens(final_reasoning)
+                                                completion_tokens = count_tokens(final_content)
 
                                                 # 构建 message 对象
                                                 message_obj = {
@@ -1049,9 +676,9 @@ After calling tools, you will receive the results and can continue the conversat
                         # 检测 tool_calls
                         tool_calls_detected, final_content = chat.detect_and_parse_tool_calls(final_content)
 
-                        prompt_tokens = len(final_prompt) // 4
-                        reasoning_tokens = len(final_reasoning) // 4
-                        completion_tokens = len(final_content) // 4
+                        prompt_tokens = count_tokens(final_prompt)
+                        reasoning_tokens = count_tokens(final_reasoning)
+                        completion_tokens = count_tokens(final_content)
 
                         # 构建 message 对象
                         message_obj = {
@@ -1283,7 +910,7 @@ After calling tools, you will receive the results and can continue the conversat
         }
 
         deepseek_resp = chat.call_completion_endpoint(
-            payload, headers, session_module.get_request_session(request), max_attempts=3
+            payload, headers, session_module.get_request_session(request)
         )
         if not deepseek_resp:
             raise HTTPException(status_code=500, detail="Failed to get completion.")
@@ -1300,23 +927,22 @@ After calling tools, you will receive the results and can continue the conversat
 
         # ========== 流式响应 ==========
         if stream:
+            # ---------- Hint 事件前置检测 ----------
+            try:
+                deepseek_resp = check_hint_events(deepseek_resp)
+            except OverloadedError:
+                deepseek_resp.close()
+                _delete_deepseek_session(request, session_id)
+                if getattr(request.state, "use_config_token", False) and hasattr(request.state, "account"):
+                    release_account(request.state.account)
+                raise HTTPException(status_code=429, detail="Server overloaded. Please retry.")
+
             def anthropic_sse_stream():
                 client_disconnected = False
                 stream_completed = False
                 try:
-                    # 收集文本用于 tool_call 检测（最后判断）
                     all_thinking = ""
                     all_text = ""
-                    visible_text = ""
-                    pending_tool_scan_text = ""
-                    tool_call_buffering = False
-                    tool_stream_buffer = ""
-                    tool_stream_id = "call_001"
-                    tool_stream_name = ""
-                    tool_stream_arg_sent = 0
-                    tool_stream_index = None
-                    tool_stream_started = False
-                    tool_calls_detected = None
 
                     # Anthropic SSE 状态
                     sse_state: dict = {
@@ -1327,14 +953,19 @@ After calling tools, you will receive the results and can continue the conversat
                         "has_thinking": False,
                     }
 
+                    # 工具调用检测器
+                    detector = chat.ToolCallStreamDetector()
+                    tool_calls_detected = None
+
                     # 先发 message_start
                     msg_start = make_message_start_event(msg_id, model, {
-                        "input_tokens": len(final_prompt) // 4,
+                        "input_tokens": count_tokens(final_prompt),
                         "output_tokens": 0,
                     })
                     yield f"event: {msg_start['event']}\ndata: {json.dumps(msg_start['data'], ensure_ascii=False)}\n\n"
 
                     result_queue: queue.Queue = queue.Queue()
+                    data_event = threading.Event()
                     last_send_time = time.time()
 
                     def process_anthropic_stream():
@@ -1344,35 +975,31 @@ After calling tools, you will receive the results and can continue the conversat
                                 try:
                                     line = raw_line.decode("utf-8")
                                 except Exception:
-                                    logger.warning("[anthropic_sse_stream] 解码失败")
                                     result_queue.put(None)
+                                    data_event.set()
                                     return
-
                                 if not line:
                                     continue
-
                                 if not line.startswith("data:"):
                                     continue
-
                                 data_str = line[5:].strip()
                                 if data_str == "[DONE]":
                                     result_queue.put(None)
+                                    data_event.set()
                                     return
-
-                                # 用 converter 解析 DeepSeek → Anthropic events
                                 try:
                                     events = deepseek_line_to_anthropic_events(line, sse_state)
-                                except Exception as e:
-                                    logger.warning(f"[anthropic_sse_stream] deepseek_line_to_anthropic_events 错误: {e}")
+                                except Exception:
                                     continue
 
                                 for ev in events:
                                     if ev["event"] == "__FINISHED__":
                                         result_queue.put("__FINISHED__")
+                                        data_event.set()
                                         return
                                     result_queue.put(ev)
+                                    data_event.set()
 
-                                    # 收集文本
                                     ed = ev["data"]
                                     if ev["event"] == "content_block_delta":
                                         delta = ed.get("delta", {})
@@ -1389,38 +1016,17 @@ After calling tools, you will receive the results and can continue the conversat
                         except Exception as e:
                             logger.warning(f"[anthropic_sse_stream] 流异常: {e}")
                             result_queue.put(None)
+                            data_event.set()
                         finally:
                             deepseek_resp.close()
 
                     process_thread = threading.Thread(target=process_anthropic_stream)
                     process_thread.start()
 
-                    def _make_tool_input_delta(index: int, partial_json: str):
-                        return {
-                            "event": "content_block_delta",
-                            "data": {
-                                "type": "content_block_delta",
-                                "index": index,
-                                "delta": {
-                                    "type": "input_json_delta",
-                                    "partial_json": partial_json,
-                                },
-                            },
-                        }
-
-                    def _make_tool_stop(index: int):
-                        return {
-                            "event": "content_block_stop",
-                            "data": {"type": "content_block_stop", "index": index},
-                        }
-
-                    def _close_active_text_block():
-                        if sse_state["block_active"]:
-                            block_index = sse_state.get("active_block_index", 0)
-                            sse_state["block_active"] = False
-                            sse_state["active_block_index"] = None
-                            return _make_tool_stop(block_index)
-                        return None
+                    def _emit_anthro(ev: dict):
+                        nonlocal last_send_time
+                        last_send_time = time.time()
+                        return f"event: {ev['event']}\ndata: {json.dumps(ev['data'], ensure_ascii=False)}\n\n"
 
                     try:
                         while True:
@@ -1428,223 +1034,118 @@ After calling tools, you will receive the results and can continue the conversat
                             if current_time - last_send_time >= constants.KEEP_ALIVE_TIMEOUT:
                                 yield ": keep-alive\n\n"
                                 last_send_time = current_time
+
+                            if not data_event.wait(timeout=min(constants.KEEP_ALIVE_TIMEOUT, 0.5)):
                                 continue
+                            data_event.clear()
+
                             try:
-                                item = result_queue.get(timeout=0.05)
+                                item = result_queue.get_nowait()
                             except queue.Empty:
                                 continue
 
                             if item is None:
                                 break
-
                             if item == "__FINISHED__":
                                 break
 
                             if item["event"] == "content_block_delta":
                                 delta = item["data"].get("delta", {})
                                 text_part = delta.get("text")
-                                if text_part is not None:
-                                    tool_buffer_started_now = False
-                                    if not has_tools:
-                                        yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
-                                        last_send_time = current_time
-                                        continue
-
-                                    if tool_call_buffering:
-                                        if text_part:
-                                            tool_stream_buffer += text_part
-                                    else:
-                                        pending_tool_scan_text += text_part
-                                        stripped_text = chat.strip_partial_tool_call_text(pending_tool_scan_text)
-                                        if stripped_text != pending_tool_scan_text:
-                                            safe_part = stripped_text
-                                            if safe_part:
-                                                safe_item = {
-                                                    "event": "content_block_delta",
-                                                    "data": {
-                                                        **item["data"],
-                                                        "delta": {**delta, "text": safe_part},
-                                                    },
-                                                }
-                                                yield f"event: {safe_item['event']}\ndata: {json.dumps(safe_item['data'], ensure_ascii=False)}\n\n"
-                                                last_send_time = current_time
-                                            visible_text += stripped_text
-                                            tool_call_buffering = True
-                                            tool_buffer_started_now = True
-                                            tool_stream_buffer = pending_tool_scan_text[len(stripped_text):]
-                                            pending_tool_scan_text = ""
-                                        else:
-                                            safe_part, pending_tool_scan_text = _split_safe_text_for_tool_detection(
-                                                pending_tool_scan_text
-                                            )
-                                            if safe_part:
-                                                visible_text += safe_part
-                                                safe_item = {
-                                                    "event": "content_block_delta",
-                                                    "data": {
-                                                        **item["data"],
-                                                        "delta": {**delta, "text": safe_part},
-                                                    },
-                                                }
-                                                yield f"event: {safe_item['event']}\ndata: {json.dumps(safe_item['data'], ensure_ascii=False)}\n\n"
-                                                last_send_time = current_time
-                                            continue
-
-                                    if not tool_call_buffering:
-                                        continue
-
-                                    if tool_call_buffering:
-                                        detected_id, detected_name = _extract_stream_tool_meta(tool_stream_buffer)
-                                        if detected_id:
-                                            tool_stream_id = detected_id
-                                        if detected_name:
-                                            tool_stream_name = detected_name
-                                        if tool_stream_name and not tool_stream_started:
-                                            stop_active_ev = _close_active_text_block()
-                                            if stop_active_ev:
-                                                yield f"event: {stop_active_ev['event']}\ndata: {json.dumps(stop_active_ev['data'], ensure_ascii=False)}\n\n"
-                                            tool_stream_index = sse_state.get("next_block_index", 0)
-                                            sse_state["next_block_index"] = tool_stream_index + 1
-                                            tool_stream_started = True
-                                            tool_start = {
-                                                "event": "content_block_start",
-                                                "data": {
-                                                    "type": "content_block_start",
-                                                    "index": tool_stream_index,
-                                                    "content_block": {
-                                                        "type": "tool_use",
-                                                        "id": tool_stream_id,
-                                                        "name": tool_stream_name,
-                                                        "input": {},
-                                                    },
-                                                },
-                                            }
-                                            yield f"event: {tool_start['event']}\ndata: {json.dumps(tool_start['data'], ensure_ascii=False)}\n\n"
-                                            last_send_time = current_time
-                                        if tool_stream_started:
-                                            arg_stream = _extract_stream_arguments(tool_stream_buffer)
-                                            if len(arg_stream) > tool_stream_arg_sent:
-                                                arg_part = arg_stream[tool_stream_arg_sent:]
-                                                tool_stream_arg_sent = len(arg_stream)
-                                                if arg_part:
-                                                    for arg_chunk in _iter_text_chunks(arg_part):
-                                                        delta_ev = _make_tool_input_delta(tool_stream_index, arg_chunk)
-                                                        yield f"event: {delta_ev['event']}\ndata: {json.dumps(delta_ev['data'], ensure_ascii=False)}\n\n"
-                                                        last_send_time = time.time()
-                                                        if TOOL_ARGUMENT_STREAM_DELAY:
-                                                            time.sleep(TOOL_ARGUMENT_STREAM_DELAY)
-                                        continue
+                                if text_part is not None and has_tools and detector.state == "detecting":
+                                    safe = detector.feed(text_part)
+                                    if safe:
+                                        yield _emit_anthro({
+                                            "event": "content_block_delta",
+                                            "data": {**item["data"], "delta": {"type": "text_delta", "text": safe}},
+                                        })
+                                    continue
+                                elif detector.state == "collecting":
+                                    detector.feed(text_part)
+                                    continue
 
                             elif item["event"] == "content_block_start":
                                 cb = item["data"].get("content_block", {})
-                                if cb.get("type") == "text" and tool_call_buffering:
+                                if cb.get("type") == "text" and (detector.state == "collecting" or detector.has_tool_start()):
                                     continue
-                            elif item["event"] == "content_block_stop" and tool_call_buffering:
+                            elif item["event"] == "content_block_stop" and detector.state == "collecting":
                                 continue
 
-                            # 发送 Anthropic SSE event
-                            yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
-                            last_send_time = current_time
+                            yield _emit_anthro(item)
 
-                        # --- 流结束：检测 tool_calls（如果启用了 tools）---
-                        parse_source = tool_stream_buffer or all_text
-                        tool_calls_detected, remaining_text = chat.detect_and_parse_tool_calls(parse_source)
-                        if tool_stream_buffer and not tool_calls_detected and tool_stream_name:
-                            args = _extract_stream_arguments(tool_stream_buffer)
-                            tool_calls_detected = [{
-                                "id": tool_stream_id,
-                                "type": "function",
-                                "function": {"name": tool_stream_name, "arguments": args or "{}"},
-                            }]
+                        # ---- 流结束：检测和处理 tool_calls ----
+                        flush = detector.force_flush()
+                        if flush and not detector.has_tool_start() and has_tools:
+                            if not sse_state["block_active"]:
+                                bi = sse_state["next_block_index"]
+                                sse_state["next_block_index"] = bi + 1
+                                sse_state["active_block_index"] = bi
+                                sse_state["block_active"] = True
+                                yield _emit_anthro({
+                                    "event": "content_block_start",
+                                    "data": {"type": "content_block_start", "index": bi, "content_block": {"type": "text", "text": ""}},
+                                })
+                            yield _emit_anthro({
+                                "event": "content_block_delta",
+                                "data": {"type": "content_block_delta", "index": sse_state["active_block_index"], "delta": {"type": "text_delta", "text": flush}},
+                            })
 
-                        if tool_stream_started and tool_stream_index is not None:
-                            stop_ev = _make_tool_stop(tool_stream_index)
-                            yield f"event: {stop_ev['event']}\ndata: {json.dumps(stop_ev['data'], ensure_ascii=False)}\n\n"
+                        if detector.has_tool_start() and detector.collected:
+                            parsed, _ = chat.detect_and_parse_tool_calls(detector.collected)
+                            if parsed:
+                                tool_calls_detected = parsed
+                        elif has_tools:
+                            parsed, _ = chat.detect_and_parse_tool_calls(all_text)
+                            if parsed:
+                                tool_calls_detected = parsed
 
-                        if pending_tool_scan_text and not tool_calls_detected:
-                            safe_part, pending_tool_scan_text = _split_safe_text_for_tool_detection(
-                                pending_tool_scan_text, force=True
-                            )
-                            if safe_part:
-                                if not sse_state["block_active"]:
-                                    text_index = sse_state.get("next_block_index", 0)
-                                    sse_state["next_block_index"] = text_index + 1
-                                    sse_state["active_block_index"] = text_index
-                                    sse_state["block_active"] = True
-                                    text_start = {
-                                        "event": "content_block_start",
-                                        "data": {
-                                            "type": "content_block_start",
-                                            "index": text_index,
-                                            "content_block": {"type": "text", "text": ""},
-                                        },
-                                    }
-                                    yield f"event: {text_start['event']}\ndata: {json.dumps(text_start['data'], ensure_ascii=False)}\n\n"
-                                text_delta = {
-                                    "event": "content_block_delta",
-                                    "data": {
-                                        "type": "content_block_delta",
-                                        "index": sse_state.get("active_block_index", 0),
-                                        "delta": {"type": "text_delta", "text": safe_part},
-                                    },
-                                }
-                                yield f"event: {text_delta['event']}\ndata: {json.dumps(text_delta['data'], ensure_ascii=False)}\n\n"
+                        # 发送 tool_use blocks
+                        if tool_calls_detected:
+                            if sse_state["block_active"]:
+                                yield _emit_anthro({
+                                    "event": "content_block_stop",
+                                    "data": {"type": "content_block_stop", "index": sse_state.get("active_block_index", 0)},
+                                })
+                                sse_state["block_active"] = False
+                                sse_state["active_block_index"] = None
 
-                        # 如果未能提前流式识别，则兼容地在结束时拆分补发。
-                        if tool_calls_detected and not tool_stream_started:
-                            tool_index = sse_state.get("next_block_index", 0)
+                            ti = sse_state.get("next_block_index", 0)
                             for tc in tool_calls_detected:
                                 func = tc.get("function", {})
                                 try:
-                                    arguments_dict = json.loads(func.get("arguments", "{}"))
+                                    args_dict = json.loads(func.get("arguments", "{}"))
                                 except (json.JSONDecodeError, TypeError):
-                                    arguments_dict = {}
-                                arguments_text = json.dumps(arguments_dict, ensure_ascii=False)
-                                tool_use_block = {
-                                    "type": "tool_use",
-                                    "id": tc.get("id", f"toolu_{tool_index}"),
-                                    "name": func.get("name", ""),
-                                    "input": {},
-                                }
-                                tool_start = {
+                                    args_dict = {}
+                                args_str = json.dumps(args_dict, ensure_ascii=False)
+                                tu_id = tc.get("id", f"toolu_{ti}")
+                                yield _emit_anthro({
                                     "event": "content_block_start",
-                                    "data": {
-                                        "type": "content_block_start",
-                                        "index": tool_index,
-                                        "content_block": tool_use_block,
-                                    },
-                                }
-                                yield f"event: {tool_start['event']}\ndata: {json.dumps(tool_start['data'], ensure_ascii=False)}\n\n"
-                                for arg_part in _iter_text_chunks(arguments_text):
-                                    delta_ev = _make_tool_input_delta(tool_index, arg_part)
-                                    yield f"event: {delta_ev['event']}\ndata: {json.dumps(delta_ev['data'], ensure_ascii=False)}\n\n"
-                                    if TOOL_ARGUMENT_STREAM_DELAY:
-                                        time.sleep(TOOL_ARGUMENT_STREAM_DELAY)
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index}, ensure_ascii=False)}\n\n"
-                                tool_index += 1
-                            sse_state["next_block_index"] = tool_index
+                                    "data": {"type": "content_block_start", "index": ti, "content_block": {"type": "tool_use", "id": tu_id, "name": func.get("name", ""), "input": {}}},
+                                })
+                                yield _emit_anthro({
+                                    "event": "content_block_delta",
+                                    "data": {"type": "content_block_delta", "index": ti, "delta": {"type": "input_json_delta", "partial_json": args_str}},
+                                })
+                                yield _emit_anthro({
+                                    "event": "content_block_stop",
+                                    "data": {"type": "content_block_stop", "index": ti},
+                                })
+                                ti += 1
+                            sse_state["next_block_index"] = ti
 
-                        # 关闭残留的 text block
-                        stop_active_ev = _close_active_text_block()
-                        if stop_active_ev:
-                            yield f"event: {stop_active_ev['event']}\ndata: {json.dumps(stop_active_ev['data'], ensure_ascii=False)}\n\n"
+                        # 关闭残留 block
+                        if sse_state["block_active"]:
+                            yield _emit_anthro({
+                                "event": "content_block_stop",
+                                "data": {"type": "content_block_stop", "index": sse_state.get("active_block_index", 0)},
+                            })
+                            sse_state["block_active"] = False
 
-                        # stop_reason
-                        anth_stop_reason = "end_turn"
-                        if tool_calls_detected:
-                            anth_stop_reason = "tool_use"
-
-                        # message_delta
-                        total_output = len(all_thinking) // 4 + len(all_text) // 4
-                        delta_ev = make_message_delta_event(
-                            stop_reason=anth_stop_reason,
-                            output_tokens=total_output,
-                        )
-                        yield f"event: {delta_ev['event']}\ndata: {json.dumps(delta_ev['data'], ensure_ascii=False)}\n\n"
-
-                        # message_stop
-                        stop_ev = make_message_stop_event()
-                        yield f"event: {stop_ev['event']}\ndata: {json.dumps(stop_ev['data'], ensure_ascii=False)}\n\n"
+                        # message_delta + message_stop
+                        stop_reason_str = "tool_use" if tool_calls_detected else "end_turn"
+                        total_out = count_tokens(all_thinking) + count_tokens(all_text)
+                        yield _emit_anthro(make_message_delta_event(stop_reason=stop_reason_str, output_tokens=total_out))
+                        yield _emit_anthro(make_message_stop_event())
 
                         stream_completed = True
 
@@ -1657,9 +1158,7 @@ After calling tools, you will receive the results and can continue the conversat
                         client_disconnected = True
                 finally:
                     _delete_deepseek_session(request, session_id)
-                    if getattr(request.state, "use_config_token", False) and hasattr(
-                        request.state, "account"
-                    ):
+                    if getattr(request.state, "use_config_token", False) and hasattr(request.state, "account"):
                         release_account(request.state.account)
 
             return StreamingResponse(
@@ -1761,8 +1260,8 @@ After calling tools, you will receive the results and can continue the conversat
             else:
                 content_blocks.append({"type": "text", "text": final_text or ""})
 
-            prompt_tokens = len(final_prompt) // 4
-            output_tokens = len(final_thinking) // 4 + len(final_text) // 4
+            prompt_tokens = count_tokens(final_prompt)
+            output_tokens = count_tokens(final_thinking) + count_tokens(final_text)
 
             response = build_anthropic_response(
                 msg_id=msg_id,
@@ -1844,6 +1343,159 @@ async def stop_stream(request: Request):
     except Exception as e:
         logger.error(f"[stop_stream] 异常: {e}")
         raise HTTPException(status_code=500, detail=f"停止流式响应失败: {str(e)}")
+
+
+# ----------------------------------------------------------------------
+# Anthropic /v1/models 端点
+# ----------------------------------------------------------------------
+@router.get("/anthropic/v1/models")
+def anthropic_list_models():
+    """返回 Anthropic-compatible models list。"""
+    model_list = [
+        {
+            "type": "model",
+            "id": "deepseek-v4-flash",
+            "display_name": "DeepSeek V4 Flash",
+            "created_at": "2024-07-18T00:00:00Z",
+        },
+        {
+            "type": "model",
+            "id": "deepseek-chat",
+            "display_name": "DeepSeek Chat",
+            "created_at": "2024-07-18T00:00:00Z",
+        },
+        {
+            "type": "model",
+            "id": "deepseek-v4-pro",
+            "display_name": "DeepSeek V4 Pro",
+            "created_at": "2024-07-18T00:00:00Z",
+        },
+        {
+            "type": "model",
+            "id": "deepseek-reasoner",
+            "display_name": "DeepSeek Reasoner",
+            "created_at": "2024-07-18T00:00:00Z",
+        },
+        {
+            "type": "model",
+            "id": "claude-sonnet-4-6",
+            "display_name": "Claude Sonnet 4.6 (via DeepSeek)",
+            "created_at": "2024-07-18T00:00:00Z",
+        },
+        {
+            "type": "model",
+            "id": "claude-opus-4-6",
+            "display_name": "Claude Opus 4.6 (via DeepSeek)",
+            "created_at": "2024-07-18T00:00:00Z",
+        },
+        {
+            "type": "model",
+            "id": "claude-haiku-4-5",
+            "display_name": "Claude Haiku 4.5 (via DeepSeek)",
+            "created_at": "2024-07-18T00:00:00Z",
+        },
+    ]
+    return JSONResponse(
+        content={
+            "type": "models",
+            "data": model_list,
+            "has_more": False,
+            "first_id": model_list[0]["id"] if model_list else None,
+            "last_id": model_list[-1]["id"] if model_list else None,
+        },
+        status_code=200,
+    )
+
+
+# ----------------------------------------------------------------------
+# Anthropic /v1/messages/stop_stream 端点
+# ----------------------------------------------------------------------
+@router.post("/anthropic/v1/messages/stop_stream")
+async def anthropic_stop_stream(request: Request):
+    """停止正在进行的 Anthropic 流式对话。请求体与 /v1/chat/stop_stream 兼容。"""
+    try:
+        determine_mode_and_token(request, allow_x_api_key=True)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+    except Exception:
+        return JSONResponse(status_code=500, content={"error": "Account login failed."})
+
+    try:
+        body = await request.json()
+        chat_session_id = body.get("chat_session_id")
+        message_id = body.get("message_id")
+
+        if not chat_session_id:
+            raise HTTPException(status_code=400, detail="缺少 chat_session_id 参数")
+
+        headers = get_auth_headers(request)
+        ds_session = session_module.get_request_session(request)
+
+        payload = {"chat_session_id": chat_session_id, "message_id": message_id}
+        resp = ds_session.post(
+            constants.DEEPSEEK_STOP_STREAM_URL,
+            headers=headers,
+            json=payload,
+            impersonate="safari15_3",
+        )
+
+        if resp.status_code == 200:
+            logger.info(f"[anthropic_stop_stream] 成功停止会话 {chat_session_id}")
+            return JSONResponse(content={"success": True, "message": "已停止流式响应"})
+        else:
+            logger.warning(f"[anthropic_stop_stream] 停止失败，状态码: {resp.status_code}")
+            return JSONResponse(
+                status_code=resp.status_code,
+                content={"success": False, "message": f"停止失败: {resp.text}"},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[anthropic_stop_stream] 异常: {e}")
+        raise HTTPException(status_code=500, detail=f"停止流式响应失败: {str(e)}")
+
+
+# ----------------------------------------------------------------------
+# Anthropic /v1/messages/count_tokens 端点
+# ----------------------------------------------------------------------
+@router.post("/anthropic/v1/messages/count_tokens")
+async def anthropic_count_tokens(request: Request):
+    """Anthropic-compatible 令牌计数端点（估算值）。"""
+    try:
+        determine_mode_and_token(request, allow_x_api_key=True)
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+    except Exception:
+        return JSONResponse(status_code=500, content={"error": "Account login failed."})
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request body")
+
+    total_chars = 0
+    for msg in body.get("messages", []):
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    total_chars += len(block.get("text", ""))
+        else:
+            total_chars += len(str(content))
+
+    system_text = body.get("system", "")
+    total_chars += len(system_text)
+
+    tools = body.get("tools", [])
+    for tool in tools:
+        total_chars += len(json.dumps(tool))
+
+    estimated_tokens = count_tokens(json.dumps(body))
+
+    return JSONResponse(
+        content={"input_tokens": estimated_tokens},
+        status_code=200,
+    )
 
 
 # ----------------------------------------------------------------------
