@@ -332,6 +332,33 @@ def _extract_loose_attr(attrs_text: str, key: str) -> str | None:
 def _parse_xml_tool_calls(content: str):
     calls = []
     spans = []
+    invoke_pattern = re.compile(
+        r"<invoke\s+name=([\'\"])(?P<name>[^\'\"]+)\1\s*>\s*(?P<body>.*?)\s*</invoke>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in invoke_pattern.finditer(content):
+        args_obj = {}
+        param_pattern = re.compile(
+            r"<parameter\s+name=([\'\"])(?P<name>[^\'\"]+)\1[^>]*>\s*(?P<value>.*?)\s*</parameter>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for param in param_pattern.finditer(match.group("body")):
+            raw_value = param.group("value").strip()
+            try:
+                value = json.loads(raw_value)
+            except json.JSONDecodeError:
+                value = raw_value
+            args_obj[_normalize_tool_name(param.group("name"))] = value
+        calls.append({
+            "id": f"call_{len(calls) + 1:03d}",
+            "type": "function",
+            "function": {
+                "name": _normalize_tool_name(match.group("name")),
+                "arguments": _json_dumps_arguments(args_obj),
+            },
+        })
+        spans.append((match.start(), match.end()))
+
     block_pattern = re.compile(
         r"<tool_call\s+name=(['\"])(?P<name>[^'\"]+)\1\s*>\s*(?P<body>.*?)\s*</tool_call>",
         re.IGNORECASE | re.DOTALL,
@@ -423,6 +450,8 @@ def strip_partial_tool_call_text(content: str) -> str:
         "<tool_call",
         "<tool_calls",
         "<function_calls",
+        "<invoke",
+        "<parameter",
         "<tool id=",
         "<tool ",
         "<tool_use",
@@ -474,7 +503,7 @@ def detect_and_parse_tool_calls(content: str):
     返回: (tool_calls_list, remaining_content)
     """
     original_content = content
-    tool_wrapper_re = r"</?(?:tool_use|t_use|tool_calls|function_calls|tools)>"
+    tool_wrapper_re = r"</?(?:tool_use|t_use|tool_calls|function_calls|tools|invoke|parameter)(?:\s+[^>]*)?>"
     content = re.sub(tool_wrapper_re, "", content, flags=re.IGNORECASE).strip()
 
     function_calls, function_spans = _parse_function_calls_block(original_content)
@@ -489,14 +518,14 @@ def detect_and_parse_tool_calls(content: str):
         remaining_content = re.sub(tool_wrapper_re, "", remaining_content, flags=re.IGNORECASE).strip()
         return _normalize_tool_calls(function_calls), remaining_content
 
-    xml_calls, xml_spans = _parse_xml_tool_calls(content)
+    xml_calls, xml_spans = _parse_xml_tool_calls(original_content)
     if xml_calls:
         remaining_parts = []
         last = 0
         for start, end in xml_spans:
-            remaining_parts.append(content[last:start])
+            remaining_parts.append(original_content[last:start])
             last = end
-        remaining_parts.append(content[last:])
+        remaining_parts.append(original_content[last:])
         remaining_content = "".join(remaining_parts)
         remaining_content = re.sub(tool_wrapper_re, "", remaining_content, flags=re.IGNORECASE).strip()
         return _normalize_tool_calls(xml_calls), remaining_content

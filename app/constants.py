@@ -3,6 +3,8 @@ DEEPSEEK_LOGIN_URL = f"https://{DEEPSEEK_HOST}/api/v0/users/login"
 DEEPSEEK_CREATE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/create"
 DEEPSEEK_CREATE_POW_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/create_pow_challenge"
 DEEPSEEK_COMPLETION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/completion"
+DEEPSEEK_FILE_UPLOAD_URL = f"https://{DEEPSEEK_HOST}/api/v0/file/upload_file"
+DEEPSEEK_FILE_FETCH_URL = f"https://{DEEPSEEK_HOST}/api/v0/file/fetch_files"
 DEEPSEEK_STOP_STREAM_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat/stop_stream"
 DEEPSEEK_DELETE_SESSION_URL = f"https://{DEEPSEEK_HOST}/api/v0/chat_session/delete"
 HIF_DLIQ_URL = "https://hif-dliq.deepseek.com/query"
@@ -28,6 +30,9 @@ BASE_HEADERS = {
 }
 WASM_PATH = "sha3_wasm_bg.7b9ca65ddd.wasm"
 KEEP_ALIVE_TIMEOUT = 5
+PROMPT_UPLOAD_THRESHOLD = 24000
+PROMPT_UPLOAD_POLL_RETRIES = 20
+PROMPT_UPLOAD_POLL_INTERVAL = 0.5
 
 
 def get_account_identifier(account):

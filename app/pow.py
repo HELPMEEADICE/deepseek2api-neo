@@ -110,7 +110,7 @@ def compute_pow_answer(
 # ----------------------------------------------------------------------
 # 获取 PoW 响应，融合计算 answer 逻辑
 # ----------------------------------------------------------------------
-def get_pow_response(request, max_attempts=3):
+def get_pow_response(request, max_attempts=3, target_path="/api/v0/chat/completion"):
     attempts = 0
     while attempts < max_attempts:
         headers = {
@@ -122,7 +122,7 @@ def get_pow_response(request, max_attempts=3):
             resp = ds_session.post(
                 constants.DEEPSEEK_CREATE_POW_URL,
                 headers=headers,
-                json={"target_path": "/api/v0/chat/completion"},
+                json={"target_path": target_path},
                 timeout=30,
                 impersonate="safari15_3",
             )
@@ -133,7 +133,10 @@ def get_pow_response(request, max_attempts=3):
         try:
             data = resp.json()
         except Exception as e:
-            logger.error(f"[get_pow_response] JSON解析异常: {e}")
+            body_preview = getattr(resp, "text", "")[:300]
+            logger.error(
+                f"[get_pow_response] JSON解析异常: {e}, status={resp.status_code}, target={target_path}, body={body_preview!r}"
+            )
             data = {}
         if resp.status_code == 200 and data.get("code") == 0:
             challenge = data["data"]["biz_data"]["challenge"]
@@ -173,7 +176,7 @@ def get_pow_response(request, max_attempts=3):
         else:
             code = data.get("code")
             logger.warning(
-                f"[get_pow_response] 获取 PoW 失败, code={code}, msg={data.get('msg')}"
+                f"[get_pow_response] 获取 PoW 失败, target={target_path}, status={resp.status_code}, code={code}, msg={data.get('msg')}"
             )
             resp.close()
             if getattr(request.state, "use_config_token", False):

@@ -22,6 +22,7 @@ from .converter import (
     make_message_start_event,
     make_message_stop_event,
 )
+from .files import prepare_prompt_with_upload
 from .pow import get_pow_response
 
 logger = logging.getLogger(__name__)
@@ -123,6 +124,10 @@ def _extract_stream_tool_meta(text: str):
         fc_match = re.search(r'<function_calls>\s*([^\s<]+)', text, re.I)
         if fc_match:
             name = fc_match.group(1)
+    if not name:
+        invoke_match = re.search(r'<invoke\s+name=["\']([^"\']+)["\']', text, re.I)
+        if invoke_match:
+            name = invoke_match.group(1)
     return call_id, name
 
 
@@ -155,6 +160,23 @@ def _extract_stream_arguments(text: str) -> str:
         if end:
             value = value[:end.start()]
         return value.strip()
+
+    invoke_match = re.search(r'<invoke\s+name=["\'][^"\']+["\']\s*>\s*(.*)', text, re.I | re.DOTALL)
+    if invoke_match:
+        body = invoke_match.group(1)
+        end = re.search(r'</invoke>', body, re.I)
+        if end:
+            body = body[:end.start()]
+        args = {}
+        param_pattern = re.compile(
+            r'<parameter\s+name=["\']([^"\']+)["\'][^>]*>\s*(.*?)\s*(?:</parameter>|$)',
+            re.I | re.DOTALL,
+        )
+        for param in param_pattern.finditer(body):
+            args[param.group(1)] = param.group(2).strip()
+        if args:
+            return json.dumps(args, ensure_ascii=False)
+        return body.strip()
     return ""
 
 
@@ -356,6 +378,7 @@ After calling tools, you will receive the results and can continue the conversat
         session_id = chat.create_session(request)
         if not session_id:
             raise HTTPException(status_code=401, detail="invalid token.")
+        completion_prompt, ref_file_ids = prepare_prompt_with_upload(request, final_prompt)
         pow_resp = get_pow_response(request)
         if not pow_resp:
             raise HTTPException(
@@ -371,8 +394,8 @@ After calling tools, you will receive the results and can continue the conversat
             "chat_session_id": session_id,
             "parent_message_id": None,
             "model_type": model_type,
-            "prompt": final_prompt,
-            "ref_file_ids": [],
+            "prompt": completion_prompt,
+            "ref_file_ids": ref_file_ids,
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
             "preempt": False,
@@ -1234,6 +1257,8 @@ After calling tools, you will receive the results and can continue the conversat
         if not session_id:
             raise HTTPException(status_code=401, detail="Invalid token.")
 
+        completion_prompt, ref_file_ids = prepare_prompt_with_upload(request, final_prompt)
+
         pow_resp = get_pow_response(request)
         if not pow_resp:
             raise HTTPException(
@@ -1250,8 +1275,8 @@ After calling tools, you will receive the results and can continue the conversat
             "chat_session_id": session_id,
             "parent_message_id": None,
             "model_type": model_type,
-            "prompt": final_prompt,
-            "ref_file_ids": [],
+            "prompt": completion_prompt,
+            "ref_file_ids": ref_file_ids,
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
             "preempt": False,
