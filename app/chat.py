@@ -77,18 +77,18 @@ def messages_prepare(messages: list) -> str:
 # ----------------------------------------------------------------------
 # 工具调用检测
 # ----------------------------------------------------------------------
-def _find_balanced_json_objects(content: str):
-    """Yield (start, end, json_text) for brace-balanced JSON objects in content."""
+def _find_balanced_json_values(content: str):
+    """Yield (start, end, json_text) for balanced JSON objects or arrays."""
     in_string = False
     escape = False
-    depth = 0
+    stack = []
     start = None
 
     for idx, ch in enumerate(content):
         if start is None:
-            if ch == "{":
+            if ch in "[{":
                 start = idx
-                depth = 1
+                stack = ["}" if ch == "{" else "]"]
                 in_string = False
                 escape = False
             continue
@@ -104,14 +104,38 @@ def _find_balanced_json_objects(content: str):
 
         if ch == '"':
             in_string = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
+        elif ch in "[{":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or ch != stack[-1]:
+                start = None
+                stack = []
+                continue
+            stack.pop()
+            if not stack:
                 end = idx + 1
                 yield start, end, content[start:end]
                 start = None
+
+
+def _json_dumps_arguments(args) -> str:
+    if isinstance(args, (dict, list)):
+        return json.dumps(args, ensure_ascii=False)
+    if args is None:
+        return "{}"
+
+    text = str(args).strip()
+    if not text:
+        return "{}"
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return json.dumps({"input": text}, ensure_ascii=False)
+
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(parsed, ensure_ascii=False)
+    return json.dumps({"input": parsed}, ensure_ascii=False)
 
 
 def _normalize_tool_calls(tool_calls):
@@ -126,30 +150,29 @@ def _normalize_tool_calls(tool_calls):
             continue
 
         call_id = call.get("id") or f"call_{i + 1:03d}"
-        call_type = call.get("type") or "function"
+        call_type = "function"
         func = call.get("function")
 
         # Be permissive for common model outputs: {"name":..., "arguments":...}
-        if func is None and "name" in call:
-            func = {"name": call.get("name"), "arguments": call.get("arguments", {})}
+        if isinstance(func, str):
+            func = {"name": func, "arguments": call.get("arguments", call.get("input", {}))}
+        elif func is None and "name" in call:
+            func = {
+                "name": call.get("name"),
+                "arguments": call.get("arguments", call.get("input", {})),
+            }
 
         if not isinstance(func, dict) or not func.get("name"):
             continue
 
-        args = func.get("arguments", "{}")
-        if isinstance(args, dict):
-            args = json.dumps(args, ensure_ascii=False)
-        elif args is None:
-            args = "{}"
-        else:
-            args = str(args)
+        args = func.get("arguments", call.get("input", {}))
 
         valid_calls.append({
             "id": str(call_id),
             "type": str(call_type),
             "function": {
-                "name": str(func["name"]),
-                "arguments": args,
+                "name": _normalize_tool_name(str(func["name"])),
+                "arguments": _json_dumps_arguments(args),
             },
         })
 
@@ -158,6 +181,84 @@ def _normalize_tool_calls(tool_calls):
 
 def _normalize_tool_name(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name or "unknown")
+
+
+def _normalize_tool_choice(tool_choice) -> str:
+    if tool_choice in (None, "auto"):
+        return "Use tools only when they are needed. If no tool is needed, answer normally."
+    if tool_choice == "none" or (isinstance(tool_choice, dict) and tool_choice.get("type") == "none"):
+        return "Do not call tools for this response."
+    if tool_choice == "required" or (isinstance(tool_choice, dict) and tool_choice.get("type") in ("any", "required")):
+        return "You must call one or more tools in this response."
+    if isinstance(tool_choice, dict):
+        name = None
+        if tool_choice.get("type") == "function":
+            name = (tool_choice.get("function") or {}).get("name")
+        elif tool_choice.get("type") == "tool":
+            name = tool_choice.get("name")
+        if name:
+            return f"You must call the tool named `{_normalize_tool_name(name)}` in this response."
+    return "Use tools only when they are needed. If no tool is needed, answer normally."
+
+
+def build_tool_system_prompt(tools: list, source: str = "openai", tool_choice=None) -> str:
+    """Build a compact, model-facing tool instruction prompt."""
+    if not tools or tool_choice == "none":
+        return ""
+
+    normalized_tools = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if source == "anthropic":
+            name = tool.get("name")
+            description = tool.get("description", "")
+            parameters = tool.get("input_schema", {})
+        else:
+            func = tool.get("function", tool)
+            if not isinstance(func, dict):
+                continue
+            name = func.get("name")
+            description = func.get("description", "")
+            parameters = func.get("parameters", {})
+        if not name:
+            continue
+        normalized_tools.append({
+            "name": _normalize_tool_name(str(name)),
+            "description": str(description or ""),
+            "parameters": parameters if isinstance(parameters, dict) else {},
+        })
+
+    if not normalized_tools:
+        return ""
+
+    tool_specs = json.dumps(normalized_tools, ensure_ascii=False, indent=2)
+    choice_instruction = _normalize_tool_choice(tool_choice)
+    return f"""You have access to the following tools:
+{tool_specs}
+
+Tool policy: {choice_instruction}
+
+When calling tools, respond with only a JSON object in this shape and no markdown or prose:
+{{"tool_calls":[{{"id":"call_001","type":"function","function":{{"name":"tool_name","arguments":{{"param":"value"}}}}}}]}}
+
+The `arguments` value may be a JSON object or a JSON string. Use an empty object when there are no arguments. You may include multiple tool calls in the array."""
+
+
+def tool_call_to_anthropic_block(tool_call: dict, fallback_id: str) -> dict:
+    func = tool_call.get("function", {}) if isinstance(tool_call, dict) else {}
+    try:
+        arguments = json.loads(func.get("arguments", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        arguments = {}
+    if not isinstance(arguments, dict):
+        arguments = {"input": arguments}
+    return {
+        "type": "tool_use",
+        "id": tool_call.get("id") or fallback_id,
+        "name": func.get("name", ""),
+        "input": arguments,
+    }
 
 
 def _parse_tag_attrs(attrs_text: str) -> dict:
@@ -245,7 +346,7 @@ def _parse_xml_tool_calls(content: str):
             "type": "function",
             "function": {
                 "name": name,
-                "arguments": json.dumps(args_obj, ensure_ascii=False),
+                "arguments": _json_dumps_arguments(args_obj),
             },
         })
         spans.append((match.start(), match.end()))
@@ -273,7 +374,7 @@ def _parse_xml_tool_calls(content: str):
             "type": attrs.get("type") or "function",
             "function": {
                 "name": _normalize_tool_name(raw_name),
-                "arguments": args,
+                "arguments": _json_dumps_arguments(args),
             },
         })
         spans.append((match.start(), match.end()))
@@ -291,10 +392,38 @@ def strip_partial_tool_call_text(content: str) -> str:
         "<t_use",
         '{"tool_calls"',
         "{\"tool_calls\"",
+        '{"tool_uses"',
+        "{\"tool_uses\"",
+        '{"tool_use"',
+        "{\"tool_use\"",
         '{"id":"call_',
         '{"id": "call_',
         "{\"id\":\"call_",
         "{\"id\": \"call_",
+        '{"id":"call',
+        '{"id": "call',
+        "{\"id\":\"call",
+        "{\"id\": \"call",
+        '[{"id":"call_',
+        '[{"id": "call_',
+        "[{\"id\":\"call_",
+        "[{\"id\": \"call_",
+        '[{"id":"call',
+        '[{"id": "call',
+        "[{\"id\":\"call",
+        "[{\"id\": \"call",
+        '[ {"id":"call_',
+        '[ {"id": "call_',
+        "[ {\"id\":\"call_",
+        "[ {\"id\": \"call_",
+        '[ {"id":"call',
+        '[ {"id": "call',
+        "[ {\"id\":\"call",
+        "[ {\"id\": \"call",
+        '[{"tool_calls"',
+        '[ {"tool_calls"',
+        "[{\"tool_calls\"",
+        "[ {\"tool_calls\"",
     ]
     indices = [idx for marker in markers if (idx := content.lower().find(marker.lower())) != -1]
     if not indices:
@@ -308,7 +437,7 @@ def detect_and_parse_tool_calls(content: str):
     返回: (tool_calls_list, remaining_content)
     """
     original_content = content
-    tool_wrapper_re = r"</?(?:tool_use|t_use|tool_calls)>"
+    tool_wrapper_re = r"</?(?:tool_use|t_use|tool_calls|tools)>"
     content = re.sub(tool_wrapper_re, "", content, flags=re.IGNORECASE).strip()
 
     xml_calls, xml_spans = _parse_xml_tool_calls(content)
@@ -321,19 +450,24 @@ def detect_and_parse_tool_calls(content: str):
         remaining_parts.append(content[last:])
         remaining_content = "".join(remaining_parts)
         remaining_content = re.sub(tool_wrapper_re, "", remaining_content, flags=re.IGNORECASE).strip()
-        return xml_calls, remaining_content
+        return _normalize_tool_calls(xml_calls), remaining_content
 
-    for start, end, json_str in _find_balanced_json_objects(content):
+    for start, end, json_str in _find_balanced_json_values(content):
         try:
             parsed = json.loads(json_str)
         except json.JSONDecodeError:
             continue
 
-        if not isinstance(parsed, dict):
+        if isinstance(parsed, list):
+            valid_calls = _normalize_tool_calls(parsed)
+        elif not isinstance(parsed, dict):
             continue
-
-        if "tool_calls" in parsed:
+        elif "tool_calls" in parsed:
             valid_calls = _normalize_tool_calls(parsed.get("tool_calls"))
+        elif "tool_uses" in parsed:
+            valid_calls = _normalize_tool_calls(parsed.get("tool_uses"))
+        elif "tool_use" in parsed:
+            valid_calls = _normalize_tool_calls(parsed.get("tool_use"))
         else:
             valid_calls = _normalize_tool_calls(parsed)
 

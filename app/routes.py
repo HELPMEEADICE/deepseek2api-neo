@@ -152,7 +152,10 @@ async def chat_completions(request: Request):
 
         # 处理 tools 参数（OpenAI 格式）
         tools_requested = req_data.get("tools") or []
-        has_tools = len(tools_requested) > 0
+        tool_system_prompt = chat.build_tool_system_prompt(
+            tools_requested, source="openai", tool_choice=req_data.get("tool_choice")
+        )
+        has_tools = bool(tool_system_prompt)
 
         # 如果有工具定义，在 messages 前添加工具使用指导的系统消息
         if has_tools:
