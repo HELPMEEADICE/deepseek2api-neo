@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 
 from . import constants, session as session_module
@@ -155,26 +156,195 @@ def _normalize_tool_calls(tool_calls):
     return valid_calls
 
 
+def _normalize_tool_name(name: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "_", name or "unknown")
+
+
+def _parse_tag_attrs(attrs_text: str) -> dict:
+    attrs = {}
+    i = 0
+    n = len(attrs_text)
+    while i < n:
+        while i < n and (attrs_text[i].isspace() or attrs_text[i] == ","):
+            i += 1
+        key_start = i
+        while i < n and (attrs_text[i].isalnum() or attrs_text[i] in "_-"):
+            i += 1
+        key = attrs_text[key_start:i].lower()
+        while i < n and attrs_text[i].isspace():
+            i += 1
+        if not key or i >= n or attrs_text[i] != "=":
+            i += 1
+            continue
+        i += 1
+        while i < n and attrs_text[i].isspace():
+            i += 1
+        if i >= n or attrs_text[i] not in ('"', "'"):
+            continue
+        quote = attrs_text[i]
+        i += 1
+        value_chars = []
+        while i < n:
+            ch = attrs_text[i]
+            if ch == "\\" and i + 1 < n:
+                value_chars.append(ch)
+                value_chars.append(attrs_text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                i += 1
+                break
+            value_chars.append(ch)
+            i += 1
+        attrs[key] = "".join(value_chars)
+    return attrs
+
+
+def _unescape_attr_json(value: str) -> str:
+    value = value.strip()
+    if "\\\"" in value:
+        try:
+            return json.loads(f'"{value}"')
+        except json.JSONDecodeError:
+            return value.replace('\\"', '"')
+    return value
+
+
+def _extract_loose_attr(attrs_text: str, key: str) -> str | None:
+    """Extract malformed last attributes like arguments="{"command": "ls"}"."""
+    match = re.search(rf"\b{re.escape(key)}\s*=\s*(['\"])", attrs_text, re.IGNORECASE)
+    if not match:
+        return None
+    quote = match.group(1)
+    start = match.end()
+    end = attrs_text.rfind(quote)
+    if end < start:
+        return None
+    value = attrs_text[start:end]
+    # Some model outputs leave an extra closing brace before the tag end: ..."}>
+    value = value.rstrip().rstrip("}").rstrip()
+    return value
+
+
+def _parse_xml_tool_calls(content: str):
+    calls = []
+    spans = []
+    block_pattern = re.compile(
+        r"<tool_call\s+name=(['\"])(?P<name>[^'\"]+)\1\s*>\s*(?P<body>.*?)\s*</tool_call>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for i, match in enumerate(block_pattern.finditer(content)):
+        name = _normalize_tool_name(match.group("name"))
+        body = match.group("body").strip()
+        try:
+            args_obj = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            args_obj = {"input": body}
+        calls.append({
+            "id": f"call_{i + 1:03d}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(args_obj, ensure_ascii=False),
+            },
+        })
+        spans.append((match.start(), match.end()))
+
+    attr_pattern = re.compile(
+        r"<tool\s+(?P<attrs>[^<>]*?)\s*/?>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in attr_pattern.finditer(content):
+        attrs = _parse_tag_attrs(match.group("attrs"))
+        if not attrs:
+            continue
+        raw_name = attrs.get("name") or attrs.get("function") or attrs.get("tool")
+        if not raw_name:
+            continue
+        # Some models emit function="name bash"; use the last token as function name.
+        raw_name = raw_name.strip().split()[-1]
+        args = attrs.get("arguments") or attrs.get("args")
+        if not args or args == "{":
+            args = _extract_loose_attr(match.group("attrs"), "arguments") or args
+            args = args or _extract_loose_attr(match.group("attrs"), "args")
+        args = _unescape_attr_json(args or "{}")
+        calls.append({
+            "id": attrs.get("id") or f"call_{len(calls) + 1:03d}",
+            "type": attrs.get("type") or "function",
+            "function": {
+                "name": _normalize_tool_name(raw_name),
+                "arguments": args,
+            },
+        })
+        spans.append((match.start(), match.end()))
+    return calls, spans
+
+
+def strip_partial_tool_call_text(content: str) -> str:
+    """Remove visible partial tool-call markup from already streamed text."""
+    markers = [
+        "<tool_call",
+        "<tool_calls",
+        "<tool id=",
+        "<tool ",
+        "<tool_use",
+        "<t_use",
+        '{"tool_calls"',
+        "{\"tool_calls\"",
+        '{"id":"call_',
+        '{"id": "call_',
+        "{\"id\":\"call_",
+        "{\"id\": \"call_",
+    ]
+    indices = [idx for marker in markers if (idx := content.lower().find(marker.lower())) != -1]
+    if not indices:
+        return content
+    return content[:min(indices)].rstrip()
+
+
 def detect_and_parse_tool_calls(content: str):
     """
     检测并解析模型返回的 tool_calls JSON
     返回: (tool_calls_list, remaining_content)
     """
+    original_content = content
+    tool_wrapper_re = r"</?(?:tool_use|t_use|tool_calls)>"
+    content = re.sub(tool_wrapper_re, "", content, flags=re.IGNORECASE).strip()
+
+    xml_calls, xml_spans = _parse_xml_tool_calls(content)
+    if xml_calls:
+        remaining_parts = []
+        last = 0
+        for start, end in xml_spans:
+            remaining_parts.append(content[last:start])
+            last = end
+        remaining_parts.append(content[last:])
+        remaining_content = "".join(remaining_parts)
+        remaining_content = re.sub(tool_wrapper_re, "", remaining_content, flags=re.IGNORECASE).strip()
+        return xml_calls, remaining_content
+
     for start, end, json_str in _find_balanced_json_objects(content):
         try:
             parsed = json.loads(json_str)
         except json.JSONDecodeError:
             continue
 
-        if not isinstance(parsed, dict) or "tool_calls" not in parsed:
+        if not isinstance(parsed, dict):
             continue
 
-        valid_calls = _normalize_tool_calls(parsed.get("tool_calls"))
+        if "tool_calls" in parsed:
+            valid_calls = _normalize_tool_calls(parsed.get("tool_calls"))
+        else:
+            valid_calls = _normalize_tool_calls(parsed)
+
         if valid_calls:
             remaining_content = (content[:start] + content[end:]).strip()
+            remaining_content = re.sub(
+                tool_wrapper_re, "", remaining_content, flags=re.IGNORECASE
+            ).strip()
             return valid_calls, remaining_content
 
-    return None, content
+    return None, original_content
 
 
 # ----------------------------------------------------------------------

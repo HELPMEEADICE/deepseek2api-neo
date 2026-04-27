@@ -250,6 +250,7 @@ After calling tools, you will receive the results and can continue the conversat
                     final_text = ""
                     final_thinking = ""
                     first_chunk_sent = False
+                    tool_call_buffering = False
                     result_queue = queue.Queue()
                     last_send_time = time.time()
 
@@ -397,14 +398,13 @@ After calling tools, you will receive the results and can continue the conversat
                                 # 检测 tool_calls（如果启用了 tools）
                                 tool_calls_detected = None
                                 final_text_content = final_text
-                                if has_tools:
-                                    tool_calls_detected, final_text_content = chat.detect_and_parse_tool_calls(final_text)
+                                tool_calls_detected, final_text_content = chat.detect_and_parse_tool_calls(final_text)
 
                                 if tool_calls_detected and final_text_content != final_text:
                                     # Do not leak the raw JSON instruction payload as assistant text.
                                     final_text = final_text_content
 
-                                if has_tools and final_text:
+                                if has_tools and final_text and not tool_calls_detected:
                                     text_delta = {"content": final_text}
                                     if not first_chunk_sent:
                                         text_delta["role"] = "assistant"
@@ -505,9 +505,15 @@ After calling tools, you will receive the results and can continue the conversat
                                 elif ctype == "text":
                                     final_text += ctext
 
-                                # When tools are enabled, buffer text until completion so raw
-                                # {"tool_calls": ...} JSON is not streamed into chat UIs.
-                                if has_tools and ctype == "text":
+                                if ctype == "text" and not tool_call_buffering:
+                                    stripped_text = chat.strip_partial_tool_call_text(final_text)
+                                    if stripped_text != final_text:
+                                        final_text = stripped_text
+                                        tool_call_buffering = True
+
+                                # When tools are enabled (or a tool-call marker appears), buffer
+                                # text until completion so raw tool-call markup is not shown.
+                                if ctype == "text" and (has_tools or tool_call_buffering):
                                     continue
 
                                 delta_obj = {}
@@ -653,9 +659,7 @@ After calling tools, you will receive the results and can continue the conversat
                                                 final_content = "".join(text_list)
 
                                                 # 检测 tool_calls
-                                                tool_calls_detected = None
-                                                if has_tools:
-                                                    tool_calls_detected, final_content = chat.detect_and_parse_tool_calls(final_content)
+                                                tool_calls_detected, final_content = chat.detect_and_parse_tool_calls(final_content)
 
                                                 prompt_tokens = len(final_prompt) // 4
                                                 reasoning_tokens = len(final_reasoning) // 4
@@ -721,9 +725,7 @@ After calling tools, you will receive the results and can continue the conversat
                         final_reasoning = "".join(think_list)
 
                         # 检测 tool_calls
-                        tool_calls_detected = None
-                        if has_tools:
-                            tool_calls_detected, final_content = chat.detect_and_parse_tool_calls(final_content)
+                        tool_calls_detected, final_content = chat.detect_and_parse_tool_calls(final_content)
 
                         prompt_tokens = len(final_prompt) // 4
                         reasoning_tokens = len(final_reasoning) // 4
@@ -1082,11 +1084,7 @@ After calling tools, you will receive the results and can continue the conversat
                             last_send_time = current_time
 
                         # --- 流结束：检测 tool_calls（如果启用了 tools）---
-                        if has_tools:
-                            tool_calls_detected, remaining_text = chat.detect_and_parse_tool_calls(all_text)
-                        else:
-                            tool_calls_detected = None
-                            remaining_text = all_text
+                        tool_calls_detected, remaining_text = chat.detect_and_parse_tool_calls(all_text)
 
                         # 如果有 tool_calls，需要先发 tool_use content blocks
                         if tool_calls_detected:
@@ -1228,9 +1226,7 @@ After calling tools, you will receive the results and can continue the conversat
             final_text = "".join(text_list)
 
             # 检测 tool_calls
-            tool_calls_detected = None
-            if has_tools:
-                tool_calls_detected, final_text = chat.detect_and_parse_tool_calls(final_text)
+            tool_calls_detected, final_text = chat.detect_and_parse_tool_calls(final_text)
 
             stop_reason = "end_turn"
 
