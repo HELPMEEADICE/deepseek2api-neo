@@ -114,9 +114,11 @@ def try_repair_json(json_text: str) -> str:
 TOOL_TAG_START = "<tool_call"
 TOOL_TAG_END = "</tool_call>"
 TOOL_JSON_MARKERS = [
-    '{"tool_calls"', '{"tool_uses"', '{"tool_use"',
-    '[{"id":"call_', '{"id":"call_',
+    '{"tool_calls"',
+    '{"tool_uses"',
     '[{"tool_calls"',
+    '[{"id":"call_',
+    '{"id":"call_',
 ]
 
 # 滑动窗口大小（足够容纳 <tool_call 全部字符）
@@ -224,12 +226,20 @@ class ToolCallStreamDetector:
 
     def _find_tool_tag(self) -> int:
         """在缓冲区中查找工具调用标记，返回索引或 -1。"""
-        for marker in TOOL_JSON_MARKERS:
-            idx = self._buffer.lower().find(marker.lower())
-            if idx >= 0:
+        buf_lower = self._buffer.lower()
+        # 优先匹配 XML 标记（最可靠）
+        idx = buf_lower.find(TOOL_TAG_START.lower())
+        if idx >= 0:
+            # 检查 <tool_call 前面不能是字母（避免匹配到 xmltag<tool_call）
+            if idx == 0 or not buf_lower[idx - 1].isalpha():
                 return idx
-        idx = self._buffer.lower().find(TOOL_TAG_START.lower())
-        return idx
+        # JSON 标记：要求标记的 { 或 [ 前不能是字母（避免 false positive）
+        for marker in TOOL_JSON_MARKERS:
+            idx = buf_lower.find(marker.lower())
+            if idx >= 0:
+                if idx == 0 or not buf_lower[idx - 1].isalpha():
+                    return idx
+        return -1
 
     def _check_partial_tag_prefix(self) -> int:
         """检查缓冲区末尾是否可能是标记的前缀（用于防止跨 chunk 拆分）。"""
@@ -251,16 +261,12 @@ class ToolCallStreamDetector:
         return fence_count % 2 == 1
 
     def force_flush(self) -> str:
-        """强制输出所有缓冲的文本（流结束时调用）。"""
-        result = ""
+        """强制输出检测状态下的缓冲文本（保留 collecting 内容供后续解析）。"""
         if self.state == "detecting" and self._buffer:
             result = self._buffer
             self._buffer = ""
-        elif self.state == "collecting":
-            result = self.collected
-            self.collected = ""
-            self.state = "done"
-        return result
+            return result
+        return ""
 
     def has_tool_start(self) -> bool:
         return self.state in ("collecting", "done")

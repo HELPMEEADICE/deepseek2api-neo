@@ -417,83 +417,78 @@ After calling tools, you will receive the results and can continue the conversat
                                 yield ": keep-alive\n\n"
                                 last_send_time = current_time
 
-                            # Event 等待替代轮询
+                            # drain queue: 每次醒来把队列中所有事件处理完
                             if not data_event.wait(timeout=min(constants.KEEP_ALIVE_TIMEOUT, 0.5)):
                                 continue
                             data_event.clear()
 
-                            try:
-                                item = result_queue.get_nowait()
-                            except queue.Empty:
-                                continue
+                            # 批量处理队列中所有项目
+                            while True:
+                                try:
+                                    item = result_queue.get_nowait()
+                                except queue.Empty:
+                                    break
 
-                            if item is None:
-                                # 流结束
-                                # 1) 刷新检测器中的残余文本
-                                flush = detector.force_flush()
-                                if flush:
-                                    # 非工具调用时，输出剩余文本
-                                    if not detector.has_tool_start():
+                                if item is None:
+                                    # 流结束
+                                    # 1) 刷新 detect 状态的残余文本
+                                    flush = detector.force_flush()
+                                    if flush and not detector.has_tool_start():
                                         yield _emit_delta({"content": flush})
 
-                                # 2) 解析工具调用
-                                tool_calls_detected = None
-                                if detector.has_tool_start():
-                                    collected = detector.collected
-                                    if collected:
-                                        parsed, _ = chat.detect_and_parse_tool_calls(collected)
+                                    # 2) 解析工具调用
+                                    tool_calls_detected = None
+                                    if detector.has_tool_start() and detector.collected:
+                                        parsed, _ = chat.detect_and_parse_tool_calls(detector.collected)
                                         if parsed:
                                             tool_calls_detected = parsed
-                                else:
-                                    # 还在 detecting 状态 — 在完整文本上检测
-                                    parsed, remaining = chat.detect_and_parse_tool_calls(final_text)
-                                    if parsed:
-                                        tool_calls_detected = parsed
-                                        final_text = remaining
+                                        # 如果解析失败，说明是误判，将 collected 内容当作普通文本输出
+                                        if not tool_calls_detected:
+                                            yield _emit_delta({"content": detector.collected})
+                                    else:
+                                        parsed, remaining = chat.detect_and_parse_tool_calls(final_text)
+                                        if parsed:
+                                            tool_calls_detected = parsed
+                                            final_text = remaining
 
-                                # 3) 发送 tool_calls (如果未流式发送过)
-                                if tool_calls_detected:
-                                    yield from _stream_tool_call_events(tool_calls_detected)
+                                    if tool_calls_detected:
+                                        yield from _stream_tool_call_events(tool_calls_detected)
 
-                                # 4) 最终统计
-                                usage = {
-                                    "prompt_tokens": count_tokens(final_prompt),
-                                    "completion_tokens": count_tokens(final_thinking) + count_tokens(final_text),
-                                    "total_tokens": count_tokens(final_prompt) + count_tokens(final_thinking) + count_tokens(final_text),
-                                    "completion_tokens_details": {"reasoning_tokens": count_tokens(final_thinking)},
-                                }
-                                finish_reason = "tool_calls" if tool_calls_detected else "stop"
-                                yield _emit_delta({}, finish_reason=finish_reason)
-                                yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}], 'usage': usage}, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
-                                stream_completed = True
-                                break
+                                    usage = {
+                                        "prompt_tokens": count_tokens(final_prompt),
+                                        "completion_tokens": count_tokens(final_thinking) + count_tokens(final_text),
+                                        "total_tokens": count_tokens(final_prompt) + count_tokens(final_thinking) + count_tokens(final_text),
+                                        "completion_tokens_details": {"reasoning_tokens": count_tokens(final_thinking)},
+                                    }
+                                    finish_reason = "tool_calls" if tool_calls_detected else "stop"
+                                    yield _emit_delta({}, finish_reason=finish_reason)
+                                    yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish_reason}], 'usage': usage}, ensure_ascii=False)}\n\ndata: [DONE]\n\n"
+                                    stream_completed = True
+                                    return  # 退出 while True
 
-                            # 处理中间内容块
-                            ctype, ptype, ctext = item
+                                ctype, ptype, ctext = item
 
-                            if search_enabled and ctext.startswith("[citation:"):
-                                continue
+                                if search_enabled and ctext.startswith("[citation:"):
+                                    continue
 
-                            if ctype != "content":
-                                continue
+                                if ctype != "content":
+                                    continue
 
-                            if ptype == "thinking":
-                                if thinking_enabled:
-                                    final_thinking += ctext
-                                    yield _emit_delta({"reasoning_content": ctext})
-                            elif ptype == "text":
-                                final_text += ctext
+                                if ptype == "thinking":
+                                    if thinking_enabled:
+                                        final_thinking += ctext
+                                        yield _emit_delta({"reasoning_content": ctext})
+                                elif ptype == "text":
+                                    final_text += ctext
 
-                                if has_tools and detector.state == "detecting":
-                                    safe = detector.feed(ctext)
-                                    if safe:
-                                        yield _emit_delta({"content": safe})
-                                    # 如果进入了 collecting 状态，文本由 detector 缓冲
-                                elif detector.state == "collecting":
-                                    # 继续收集工具调用
-                                    detector.feed(ctext)
-                                else:
-                                    yield _emit_delta({"content": ctext})
+                                    if has_tools and detector.state == "detecting":
+                                        safe = detector.feed(ctext)
+                                        if safe:
+                                            yield _emit_delta({"content": safe})
+                                    elif detector.state == "collecting":
+                                        detector.feed(ctext)
+                                    else:
+                                        yield _emit_delta({"content": ctext})
 
                     except GeneratorExit:
                         logger.info(f"[sse_stream] 客户端断开连接 session={session_id}")
@@ -1039,39 +1034,44 @@ After calling tools, you will receive the results and can continue the conversat
                                 continue
                             data_event.clear()
 
-                            try:
-                                item = result_queue.get_nowait()
-                            except queue.Empty:
-                                continue
+                            # 批量处理队列中所有项目
+                            while True:
+                                try:
+                                    item = result_queue.get_nowait()
+                                except queue.Empty:
+                                    break
 
-                            if item is None:
-                                break
-                            if item == "__FINISHED__":
-                                break
+                                if item is None:
+                                    break
+                                if item == "__FINISHED__":
+                                    break
 
-                            if item["event"] == "content_block_delta":
-                                delta = item["data"].get("delta", {})
-                                text_part = delta.get("text")
-                                if text_part is not None and has_tools and detector.state == "detecting":
-                                    safe = detector.feed(text_part)
-                                    if safe:
-                                        yield _emit_anthro({
-                                            "event": "content_block_delta",
-                                            "data": {**item["data"], "delta": {"type": "text_delta", "text": safe}},
-                                        })
+                                if item["event"] == "content_block_delta":
+                                    delta = item["data"].get("delta", {})
+                                    text_part = delta.get("text")
+                                    if text_part is not None and has_tools and detector.state == "detecting":
+                                        safe = detector.feed(text_part)
+                                        if safe:
+                                            yield _emit_anthro({
+                                                "event": "content_block_delta",
+                                                "data": {**item["data"], "delta": {"type": "text_delta", "text": safe}},
+                                            })
+                                        continue
+                                    elif detector.state == "collecting":
+                                        detector.feed(text_part)
+                                        continue
+
+                                elif item["event"] == "content_block_start":
+                                    cb = item["data"].get("content_block", {})
+                                    if cb.get("type") == "text" and (detector.state == "collecting" or detector.has_tool_start()):
+                                        continue
+                                elif item["event"] == "content_block_stop" and detector.state == "collecting":
                                     continue
-                                elif detector.state == "collecting":
-                                    detector.feed(text_part)
-                                    continue
 
-                            elif item["event"] == "content_block_start":
-                                cb = item["data"].get("content_block", {})
-                                if cb.get("type") == "text" and (detector.state == "collecting" or detector.has_tool_start()):
-                                    continue
-                            elif item["event"] == "content_block_stop" and detector.state == "collecting":
-                                continue
+                                yield _emit_anthro(item)
 
-                            yield _emit_anthro(item)
+                            if item is None or item == "__FINISHED__":
+                                break  # 退出外层 while True
 
                         # ---- 流结束：检测和处理 tool_calls ----
                         flush = detector.force_flush()
@@ -1094,6 +1094,21 @@ After calling tools, you will receive the results and can continue the conversat
                             parsed, _ = chat.detect_and_parse_tool_calls(detector.collected)
                             if parsed:
                                 tool_calls_detected = parsed
+                            else:
+                                # 误判：将 collected 当作普通文本输出
+                                if not sse_state["block_active"]:
+                                    bi = sse_state["next_block_index"]
+                                    sse_state["next_block_index"] = bi + 1
+                                    sse_state["active_block_index"] = bi
+                                    sse_state["block_active"] = True
+                                    yield _emit_anthro({
+                                        "event": "content_block_start",
+                                        "data": {"type": "content_block_start", "index": bi, "content_block": {"type": "text", "text": ""}},
+                                    })
+                                yield _emit_anthro({
+                                    "event": "content_block_delta",
+                                    "data": {"type": "content_block_delta", "index": sse_state["active_block_index"], "delta": {"type": "text_delta", "text": detector.collected}},
+                                })
                         elif has_tools:
                             parsed, _ = chat.detect_and_parse_tool_calls(all_text)
                             if parsed:
