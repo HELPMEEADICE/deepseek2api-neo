@@ -1,6 +1,7 @@
 import json
 import logging
 import queue
+import re
 import threading
 import time
 
@@ -26,6 +27,132 @@ from .pow import get_pow_response
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _decode_json_string_prefix(raw: str) -> str:
+    chars = []
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '"':
+            break
+        if ch == "\\":
+            if i + 1 >= len(raw):
+                break
+            nxt = raw[i + 1]
+            mapping = {
+                '"': '"', "\\": "\\", "/": "/",
+                "b": "\b", "f": "\f", "n": "\n",
+                "r": "\r", "t": "\t",
+            }
+            if nxt == "u":
+                if i + 6 > len(raw):
+                    break
+                try:
+                    chars.append(chr(int(raw[i + 2:i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    chars.append(nxt)
+            else:
+                chars.append(mapping.get(nxt, nxt))
+            i += 2
+            continue
+        chars.append(ch)
+        i += 1
+    return "".join(chars)
+
+
+def _balanced_json_prefix(raw: str) -> str:
+    in_string = False
+    escape = False
+    stack = []
+    started = False
+    start = 0
+    for idx, ch in enumerate(raw):
+        if not started:
+            if ch.isspace():
+                continue
+            if ch not in "[{":
+                return ""
+            start = idx
+            stack = ["}" if ch == "{" else "]"]
+            started = True
+            continue
+
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch in "[{":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or ch != stack[-1]:
+                return ""
+            stack.pop()
+            if not stack:
+                return raw[start:idx + 1]
+    return ""
+
+
+def _extract_stream_tool_meta(text: str):
+    call_id = None
+    name = None
+    id_match = re.search(r'"id"\s*:\s*"([^"]+)"', text)
+    if id_match:
+        call_id = id_match.group(1)
+    name_match = re.search(r'"name"\s*:\s*"([^"]+)"', text)
+    if name_match:
+        name = name_match.group(1)
+    if not name:
+        xml_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', text, re.I)
+        if xml_match:
+            name = xml_match.group(1)
+    if not name:
+        attr_match = re.search(r'\bfunction=["\'](?:name\s+)?([^"\'\s>]+)', text, re.I)
+        if attr_match:
+            name = attr_match.group(1)
+    return call_id, name
+
+
+def _extract_stream_arguments(text: str) -> str:
+    match = re.search(r'"arguments"\s*:\s*', text)
+    if match:
+        raw = text[match.end():]
+        stripped = raw.lstrip()
+        if stripped.startswith('"'):
+            return _decode_json_string_prefix(stripped[1:])
+        json_prefix = _balanced_json_prefix(stripped)
+        if json_prefix:
+            return json_prefix
+        return stripped
+
+    xml_match = re.search(r'<tool_call\s+name=["\'][^"\']+["\']\s*>', text, re.I)
+    if xml_match:
+        value = text[xml_match.end():]
+        end = re.search(r'</tool_call>', value, re.I)
+        return value[:end.start()] if end else value
+
+    attr_match = re.search(r'\barguments=["\']', text, re.I)
+    if attr_match:
+        return _decode_json_string_prefix(text[attr_match.end():])
+    return ""
+
+
+TOOL_ARGUMENT_STREAM_CHUNK_SIZE = 24
+TOOL_ARGUMENT_STREAM_DELAY = 0.015
+
+
+def _iter_text_chunks(text: str, size: int = TOOL_ARGUMENT_STREAM_CHUNK_SIZE):
+    for start in range(0, len(text), size):
+        yield text[start:start + size]
 
 
 # ----------------------------------------------------------------------
@@ -254,6 +381,11 @@ After calling tools, you will receive the results and can continue the conversat
                     final_thinking = ""
                     first_chunk_sent = False
                     tool_call_buffering = False
+                    tool_stream_started = False
+                    tool_stream_arg_sent = 0
+                    tool_stream_id = "call_001"
+                    tool_stream_name = ""
+                    tool_stream_buffer = ""
                     result_queue = queue.Queue()
                     last_send_time = time.time()
 
@@ -385,6 +517,45 @@ After calling tools, you will receive the results and can continue the conversat
                     process_thread = threading.Thread(target=process_data)
                     process_thread.start()
 
+                    def _stream_tool_delta(tool_id=None, tool_name=None, arguments_part=None):
+                        nonlocal first_chunk_sent, last_send_time
+                        delta_tool = {"index": 0}
+                        if tool_id is not None:
+                            delta_tool["id"] = tool_id
+                            delta_tool["type"] = "function"
+                        func_delta = {}
+                        if tool_name is not None:
+                            func_delta["name"] = tool_name
+                        if arguments_part is not None:
+                            func_delta["arguments"] = arguments_part
+                        if func_delta:
+                            delta_tool["function"] = func_delta
+
+                        delta_obj = {"tool_calls": [delta_tool]}
+                        if not first_chunk_sent:
+                            delta_obj["role"] = "assistant"
+                            first_chunk_sent = True
+
+                        out = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": delta_obj,
+                                "finish_reason": None,
+                            }],
+                        }
+                        last_send_time = time.time()
+                        return f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+
+                    def _stream_tool_arguments(arguments_part: str):
+                        for arg_part in _iter_text_chunks(arguments_part):
+                            yield _stream_tool_delta(arguments_part=arg_part)
+                            if TOOL_ARGUMENT_STREAM_DELAY:
+                                time.sleep(TOOL_ARGUMENT_STREAM_DELAY)
+
                     try:
                         while True:
                             current_time = time.time()
@@ -401,7 +572,24 @@ After calling tools, you will receive the results and can continue the conversat
                                 # 检测 tool_calls（如果启用了 tools）
                                 tool_calls_detected = None
                                 final_text_content = final_text
-                                tool_calls_detected, final_text_content = chat.detect_and_parse_tool_calls(final_text)
+                                parse_source = tool_stream_buffer or final_text
+                                tool_calls_detected, parsed_remaining = chat.detect_and_parse_tool_calls(parse_source)
+                                if tool_stream_buffer:
+                                    final_text_content = final_text
+                                    if not tool_calls_detected:
+                                        detected_name = tool_stream_name
+                                        args = _extract_stream_arguments(tool_stream_buffer)
+                                        if detected_name:
+                                            tool_calls_detected = [{
+                                                "id": tool_stream_id,
+                                                "type": "function",
+                                                "function": {
+                                                    "name": detected_name,
+                                                    "arguments": args or "{}",
+                                                },
+                                            }]
+                                else:
+                                    final_text_content = parsed_remaining
 
                                 if tool_calls_detected and final_text_content != final_text:
                                     # Do not leak the raw JSON instruction payload as assistant text.
@@ -427,7 +615,7 @@ After calling tools, you will receive the results and can continue the conversat
                                     last_send_time = current_time
 
                                 # 如果检测到 tool_calls，先发送 tool_calls chunk
-                                if tool_calls_detected:
+                                if tool_calls_detected and not tool_stream_started:
                                     for tool_index, tool_call in enumerate(tool_calls_detected):
                                         func = tool_call.get("function", {})
                                         arguments = func.get("arguments", "{}")
@@ -461,8 +649,7 @@ After calling tools, you will receive the results and can continue the conversat
                                         yield f"data: {json.dumps(tool_call_chunk, ensure_ascii=False)}\n\n"
                                         last_send_time = current_time
 
-                                        for arg_start in range(0, len(arguments), 256):
-                                            arg_part = arguments[arg_start:arg_start + 256]
+                                        for arg_part in _iter_text_chunks(arguments):
                                             arg_chunk = {
                                                 "id": completion_id,
                                                 "object": "chat.completion.chunk",
@@ -482,7 +669,9 @@ After calling tools, you will receive the results and can continue the conversat
                                                 }],
                                             }
                                             yield f"data: {json.dumps(arg_chunk, ensure_ascii=False)}\n\n"
-                                            last_send_time = current_time
+                                            last_send_time = time.time()
+                                            if TOOL_ARGUMENT_STREAM_DELAY:
+                                                time.sleep(TOOL_ARGUMENT_STREAM_DELAY)
 
                                 # 发送最终统计信息
                                 prompt_tokens = len(final_prompt) // 4
@@ -539,10 +728,39 @@ After calling tools, you will receive the results and can continue the conversat
                                     final_text += ctext
 
                                 if ctype == "text" and not tool_call_buffering:
+                                    tool_buffer_started_now = False
                                     stripped_text = chat.strip_partial_tool_call_text(final_text)
                                     if stripped_text != final_text:
-                                        final_text = stripped_text
                                         tool_call_buffering = True
+                                        tool_buffer_started_now = True
+                                        tool_stream_buffer = final_text[len(stripped_text):]
+                                        final_text = stripped_text
+                                else:
+                                    tool_buffer_started_now = False
+
+                                if ctype == "text" and tool_call_buffering:
+                                    if not tool_buffer_started_now and ctext:
+                                        tool_stream_buffer += ctext
+                                    full_buffer = tool_stream_buffer
+                                    detected_id, detected_name = _extract_stream_tool_meta(full_buffer)
+                                    if detected_id:
+                                        tool_stream_id = detected_id
+                                    if detected_name:
+                                        tool_stream_name = detected_name
+                                    if tool_stream_name and not tool_stream_started:
+                                        tool_stream_started = True
+                                        yield _stream_tool_delta(
+                                            tool_id=tool_stream_id,
+                                            tool_name=tool_stream_name,
+                                            arguments_part="",
+                                        )
+                                    if tool_stream_started:
+                                        arg_stream = _extract_stream_arguments(full_buffer)
+                                        if len(arg_stream) > tool_stream_arg_sent:
+                                            arg_part = arg_stream[tool_stream_arg_sent:]
+                                            tool_stream_arg_sent = len(arg_stream)
+                                            if arg_part:
+                                                yield from _stream_tool_arguments(arg_part)
 
                                 # When tools are enabled (or a tool-call marker appears), buffer
                                 # text until completion so raw tool-call markup is not shown.
@@ -1016,6 +1234,15 @@ After calling tools, you will receive the results and can continue the conversat
                     # 收集文本用于 tool_call 检测（最后判断）
                     all_thinking = ""
                     all_text = ""
+                    visible_text = ""
+                    tool_call_buffering = False
+                    tool_stream_buffer = ""
+                    tool_stream_id = "call_001"
+                    tool_stream_name = ""
+                    tool_stream_arg_sent = 0
+                    tool_stream_index = None
+                    tool_stream_started = False
+                    tool_calls_detected = None
 
                     # Anthropic SSE 状态
                     sse_state: dict = {
@@ -1094,6 +1321,33 @@ After calling tools, you will receive the results and can continue the conversat
                     process_thread = threading.Thread(target=process_anthropic_stream)
                     process_thread.start()
 
+                    def _make_tool_input_delta(index: int, partial_json: str):
+                        return {
+                            "event": "content_block_delta",
+                            "data": {
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": partial_json,
+                                },
+                            },
+                        }
+
+                    def _make_tool_stop(index: int):
+                        return {
+                            "event": "content_block_stop",
+                            "data": {"type": "content_block_stop", "index": index},
+                        }
+
+                    def _close_active_text_block():
+                        if sse_state["block_active"]:
+                            block_index = sse_state.get("active_block_index", 0)
+                            sse_state["block_active"] = False
+                            sse_state["active_block_index"] = None
+                            return _make_tool_stop(block_index)
+                        return None
+
                     try:
                         while True:
                             current_time = time.time()
@@ -1112,15 +1366,114 @@ After calling tools, you will receive the results and can continue the conversat
                             if item == "__FINISHED__":
                                 break
 
+                            if item["event"] == "content_block_delta":
+                                delta = item["data"].get("delta", {})
+                                text_part = delta.get("text")
+                                if text_part is not None:
+                                    tool_buffer_started_now = False
+                                    if tool_call_buffering:
+                                        if text_part:
+                                            tool_stream_buffer += text_part
+                                    else:
+                                        visible_text += text_part
+                                        stripped_text = chat.strip_partial_tool_call_text(visible_text)
+                                        if stripped_text == visible_text:
+                                            yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
+                                            last_send_time = current_time
+                                            continue
+
+                                        previous_visible_len = len(visible_text) - len(text_part)
+                                        if len(stripped_text) > previous_visible_len:
+                                            safe_part = stripped_text[previous_visible_len:]
+                                            if safe_part:
+                                                safe_item = {
+                                                    "event": "content_block_delta",
+                                                    "data": {
+                                                        **item["data"],
+                                                        "delta": {**delta, "text": safe_part},
+                                                    },
+                                                }
+                                                yield f"event: {safe_item['event']}\ndata: {json.dumps(safe_item['data'], ensure_ascii=False)}\n\n"
+                                                last_send_time = current_time
+
+                                        tool_call_buffering = True
+                                        tool_buffer_started_now = True
+                                        tool_stream_buffer = visible_text[len(stripped_text):]
+                                        visible_text = stripped_text
+
+                                    if not tool_call_buffering:
+                                        continue
+
+                                    if tool_call_buffering:
+                                        detected_id, detected_name = _extract_stream_tool_meta(tool_stream_buffer)
+                                        if detected_id:
+                                            tool_stream_id = detected_id
+                                        if detected_name:
+                                            tool_stream_name = detected_name
+                                        if tool_stream_name and not tool_stream_started:
+                                            stop_active_ev = _close_active_text_block()
+                                            if stop_active_ev:
+                                                yield f"event: {stop_active_ev['event']}\ndata: {json.dumps(stop_active_ev['data'], ensure_ascii=False)}\n\n"
+                                            tool_stream_index = sse_state.get("next_block_index", 0)
+                                            sse_state["next_block_index"] = tool_stream_index + 1
+                                            tool_stream_started = True
+                                            tool_start = {
+                                                "event": "content_block_start",
+                                                "data": {
+                                                    "type": "content_block_start",
+                                                    "index": tool_stream_index,
+                                                    "content_block": {
+                                                        "type": "tool_use",
+                                                        "id": tool_stream_id,
+                                                        "name": tool_stream_name,
+                                                        "input": {},
+                                                    },
+                                                },
+                                            }
+                                            yield f"event: {tool_start['event']}\ndata: {json.dumps(tool_start['data'], ensure_ascii=False)}\n\n"
+                                            last_send_time = current_time
+                                        if tool_stream_started:
+                                            arg_stream = _extract_stream_arguments(tool_stream_buffer)
+                                            if len(arg_stream) > tool_stream_arg_sent:
+                                                arg_part = arg_stream[tool_stream_arg_sent:]
+                                                tool_stream_arg_sent = len(arg_stream)
+                                                if arg_part:
+                                                    for arg_chunk in _iter_text_chunks(arg_part):
+                                                        delta_ev = _make_tool_input_delta(tool_stream_index, arg_chunk)
+                                                        yield f"event: {delta_ev['event']}\ndata: {json.dumps(delta_ev['data'], ensure_ascii=False)}\n\n"
+                                                        last_send_time = time.time()
+                                                        if TOOL_ARGUMENT_STREAM_DELAY:
+                                                            time.sleep(TOOL_ARGUMENT_STREAM_DELAY)
+                                        continue
+
+                            elif item["event"] == "content_block_start":
+                                cb = item["data"].get("content_block", {})
+                                if cb.get("type") == "text" and tool_call_buffering:
+                                    continue
+                            elif item["event"] == "content_block_stop" and tool_call_buffering:
+                                continue
+
                             # 发送 Anthropic SSE event
                             yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
                             last_send_time = current_time
 
                         # --- 流结束：检测 tool_calls（如果启用了 tools）---
-                        tool_calls_detected, remaining_text = chat.detect_and_parse_tool_calls(all_text)
+                        parse_source = tool_stream_buffer or all_text
+                        tool_calls_detected, remaining_text = chat.detect_and_parse_tool_calls(parse_source)
+                        if tool_stream_buffer and not tool_calls_detected and tool_stream_name:
+                            args = _extract_stream_arguments(tool_stream_buffer)
+                            tool_calls_detected = [{
+                                "id": tool_stream_id,
+                                "type": "function",
+                                "function": {"name": tool_stream_name, "arguments": args or "{}"},
+                            }]
 
-                        # 如果有 tool_calls，需要先发 tool_use content blocks
-                        if tool_calls_detected:
+                        if tool_stream_started and tool_stream_index is not None:
+                            stop_ev = _make_tool_stop(tool_stream_index)
+                            yield f"event: {stop_ev['event']}\ndata: {json.dumps(stop_ev['data'], ensure_ascii=False)}\n\n"
+
+                        # 如果未能提前流式识别，则兼容地在结束时拆分补发。
+                        if tool_calls_detected and not tool_stream_started:
                             tool_index = sse_state.get("next_block_index", 0)
                             for tc in tool_calls_detected:
                                 func = tc.get("function", {})
@@ -1128,11 +1481,12 @@ After calling tools, you will receive the results and can continue the conversat
                                     arguments_dict = json.loads(func.get("arguments", "{}"))
                                 except (json.JSONDecodeError, TypeError):
                                     arguments_dict = {}
+                                arguments_text = json.dumps(arguments_dict, ensure_ascii=False)
                                 tool_use_block = {
                                     "type": "tool_use",
                                     "id": tc.get("id", f"toolu_{tool_index}"),
                                     "name": func.get("name", ""),
-                                    "input": arguments_dict,
+                                    "input": {},
                                 }
                                 tool_start = {
                                     "event": "content_block_start",
@@ -1143,16 +1497,19 @@ After calling tools, you will receive the results and can continue the conversat
                                     },
                                 }
                                 yield f"event: {tool_start['event']}\ndata: {json.dumps(tool_start['data'], ensure_ascii=False)}\n\n"
+                                for arg_part in _iter_text_chunks(arguments_text):
+                                    delta_ev = _make_tool_input_delta(tool_index, arg_part)
+                                    yield f"event: {delta_ev['event']}\ndata: {json.dumps(delta_ev['data'], ensure_ascii=False)}\n\n"
+                                    if TOOL_ARGUMENT_STREAM_DELAY:
+                                        time.sleep(TOOL_ARGUMENT_STREAM_DELAY)
                                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': tool_index}, ensure_ascii=False)}\n\n"
                                 tool_index += 1
                             sse_state["next_block_index"] = tool_index
 
                         # 关闭残留的 text block
-                        if sse_state["block_active"]:
-                            block_index = sse_state.get("active_block_index", 0)
-                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index}, ensure_ascii=False)}\n\n"
-                            sse_state["block_active"] = False
-                            sse_state["active_block_index"] = None
+                        stop_active_ev = _close_active_text_block()
+                        if stop_active_ev:
+                            yield f"event: {stop_active_ev['event']}\ndata: {json.dumps(stop_active_ev['data'], ensure_ascii=False)}\n\n"
 
                         # stop_reason
                         anth_stop_reason = "end_turn"
