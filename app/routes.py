@@ -429,10 +429,17 @@ After calling tools, you will receive the results and can continue the conversat
                                 # 如果检测到 tool_calls，先发送 tool_calls chunk
                                 if tool_calls_detected:
                                     for tool_index, tool_call in enumerate(tool_calls_detected):
+                                        func = tool_call.get("function", {})
+                                        arguments = func.get("arguments", "{}")
                                         delta_obj = {
                                             "tool_calls": [{
                                                 "index": tool_index,
-                                                **tool_call,
+                                                "id": tool_call.get("id", f"call_{tool_index + 1:03d}"),
+                                                "type": tool_call.get("type", "function"),
+                                                "function": {
+                                                    "name": func.get("name", ""),
+                                                    "arguments": "",
+                                                },
                                             }]
                                         }
                                         if not first_chunk_sent:
@@ -453,6 +460,29 @@ After calling tools, you will receive the results and can continue the conversat
                                         }
                                         yield f"data: {json.dumps(tool_call_chunk, ensure_ascii=False)}\n\n"
                                         last_send_time = current_time
+
+                                        for arg_start in range(0, len(arguments), 256):
+                                            arg_part = arguments[arg_start:arg_start + 256]
+                                            arg_chunk = {
+                                                "id": completion_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": created_time,
+                                                "model": model,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {
+                                                        "tool_calls": [{
+                                                            "index": tool_index,
+                                                            "function": {
+                                                                "arguments": arg_part,
+                                                            },
+                                                        }]
+                                                    },
+                                                    "finish_reason": None,
+                                                }],
+                                            }
+                                            yield f"data: {json.dumps(arg_chunk, ensure_ascii=False)}\n\n"
+                                            last_send_time = current_time
 
                                 # 发送最终统计信息
                                 prompt_tokens = len(final_prompt) // 4
