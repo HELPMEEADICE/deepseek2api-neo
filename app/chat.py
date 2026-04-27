@@ -383,11 +383,46 @@ def _parse_xml_tool_calls(content: str):
     return calls, spans
 
 
+def _parse_function_calls_block(content: str):
+    calls = []
+    spans = []
+    pattern = re.compile(
+        r"<function_calls>\s*(?P<body>.*?)\s*</function_calls>",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for block in pattern.finditer(content):
+        lines = [line.strip() for line in block.group("body").splitlines() if line.strip()]
+        i = 0
+        while i < len(lines):
+            name = lines[i]
+            args_text = "{}"
+            if i + 1 < len(lines):
+                args_text = lines[i + 1]
+                i += 2
+            else:
+                i += 1
+            try:
+                args_obj = json.loads(args_text) if args_text else {}
+            except json.JSONDecodeError:
+                args_obj = {"input": args_text}
+            calls.append({
+                "id": f"call_{len(calls) + 1:03d}",
+                "type": "function",
+                "function": {
+                    "name": _normalize_tool_name(name),
+                    "arguments": _json_dumps_arguments(args_obj),
+                },
+            })
+        spans.append((block.start(), block.end()))
+    return calls, spans
+
+
 def strip_partial_tool_call_text(content: str) -> str:
     """Remove visible partial tool-call markup from already streamed text."""
     markers = [
         "<tool_call",
         "<tool_calls",
+        "<function_calls",
         "<tool id=",
         "<tool ",
         "<tool_use",
@@ -439,8 +474,20 @@ def detect_and_parse_tool_calls(content: str):
     返回: (tool_calls_list, remaining_content)
     """
     original_content = content
-    tool_wrapper_re = r"</?(?:tool_use|t_use|tool_calls|tools)>"
+    tool_wrapper_re = r"</?(?:tool_use|t_use|tool_calls|function_calls|tools)>"
     content = re.sub(tool_wrapper_re, "", content, flags=re.IGNORECASE).strip()
+
+    function_calls, function_spans = _parse_function_calls_block(original_content)
+    if function_calls:
+        remaining_parts = []
+        last = 0
+        for start, end in function_spans:
+            remaining_parts.append(original_content[last:start])
+            last = end
+        remaining_parts.append(original_content[last:])
+        remaining_content = "".join(remaining_parts)
+        remaining_content = re.sub(tool_wrapper_re, "", remaining_content, flags=re.IGNORECASE).strip()
+        return _normalize_tool_calls(function_calls), remaining_content
 
     xml_calls, xml_spans = _parse_xml_tool_calls(content)
     if xml_calls:

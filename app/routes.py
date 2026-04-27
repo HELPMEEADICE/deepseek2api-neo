@@ -119,6 +119,10 @@ def _extract_stream_tool_meta(text: str):
         attr_match = re.search(r'\bfunction=["\'](?:name\s+)?([^"\'\s>]+)', text, re.I)
         if attr_match:
             name = attr_match.group(1)
+    if not name:
+        fc_match = re.search(r'<function_calls>\s*([^\s<]+)', text, re.I)
+        if fc_match:
+            name = fc_match.group(1)
     return call_id, name
 
 
@@ -143,6 +147,14 @@ def _extract_stream_arguments(text: str) -> str:
     attr_match = re.search(r'\barguments=["\']', text, re.I)
     if attr_match:
         return _decode_json_string_prefix(text[attr_match.end():])
+
+    fc_match = re.search(r'<function_calls>\s*[^\s<]+\s+(.*)', text, re.I | re.DOTALL)
+    if fc_match:
+        value = fc_match.group(1)
+        end = re.search(r'\n\s*[^\s<{]+\s*\n\s*[{\[]|</function_calls>', value, re.I)
+        if end:
+            value = value[:end.start()]
+        return value.strip()
     return ""
 
 
