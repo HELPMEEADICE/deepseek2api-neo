@@ -169,6 +169,23 @@ body {
   background: transparent;
 }
 .chip .material-symbols-rounded { font-size: 18px; }
+.chip--active {
+  border-color: var(--md-sys-color-primary);
+  color: var(--md-sys-color-primary);
+  background: var(--md-sys-color-primary-container);
+  transition: all var(--transition-standard);
+}
+.chip--active.has-connections {
+  border-color: var(--md-sys-color-error);
+  color: var(--md-sys-color-on-error-container);
+  background: var(--md-sys-color-error-container);
+  animation: pulse-chip 2s ease-in-out infinite;
+}
+@keyframes pulse-chip {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(179,38,30,0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(179,38,30,0); }
+}
+.chip__suffix { font: var(--md-typescale-label-small); opacity: 0.7; }
 
 /* ----- 内容区域 ----- */
 .main-content {

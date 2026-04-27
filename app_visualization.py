@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -50,6 +51,24 @@ TRACKED_ENDPOINTS = {
     "/v1/chat/completions",
     "/v1/messages",
 }
+
+# 活动连接计数（线程安全）
+_active_connections = 0
+_active_lock = threading.Lock()
+
+
+def _inc_active():
+    global _active_connections
+    with _active_lock:
+        _active_connections += 1
+
+
+def _dec_active():
+    global _active_connections
+    with _active_lock:
+        _active_connections -= 1
+        if _active_connections < 0:
+            _active_connections = 0
 
 
 # =============================================================================
@@ -190,118 +209,122 @@ class StatsASGIMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # 1) 从 ASGI receive 完整读取请求体
-        body_chunks = []
-        more_body = True
-        while more_body:
-            msg = await receive()
-            body = msg.get("body", b"")
-            if body:
-                body_chunks.append(body)
-            more_body = msg.get("more_body", False)
-        body_bytes = b"".join(body_chunks)
-
-        # 2) 解析请求参数
-        start_ts = time.time()
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        model = "unknown"
-        stream = False
-        thinking = True
-        prompt_est = 0
-
-        if body_bytes:
-            try:
-                data = json.loads(body_bytes)
-                model = data.get("model", "unknown")
-                stream = bool(data.get("stream", False))
-
-                t_obj = data.get("thinking")
-                if isinstance(t_obj, dict):
-                    thinking = t_obj.get("type") == "enabled"
-                elif isinstance(t_obj, bool):
-                    thinking = t_obj
-                else:
-                    thinking = data.get("thinking_enabled", True)
-
-                msgs = data.get("messages", [])
-                sys_ = data.get("system", "")
-                prompt_est = len(sys_ + json.dumps(msgs, ensure_ascii=False)) // 4
-            except Exception:
-                pass
-
-        # 3) 构造 wrapped_receive：首次返回缓存 body，后续透传（断连检测）
-        body_consumed = False
-
-        async def wrapped_receive():
-            nonlocal body_consumed
-            if not body_consumed:
-                body_consumed = True
-                return {"type": "http.request", "body": body_bytes, "more_body": False}
-            return await receive()
-
-        # 4) 始终拦截 response body 以提取 token（流式 SSE 也包含最后一条 usage 信息）
-        response_body = bytearray()
-
-        async def wrapped_send(message):
-            if message["type"] == "http.response.body":
-                response_body.extend(message.get("body", b""))
-            await send(message)
-
-        # 5) 执行下游（始终使用 wrapped_send 捕获所有 body）
-        await self.app(scope, wrapped_receive, wrapped_send)
-
-        # 6) 提取账号（由 determine_mode_and_token 注入到 request.state，通过 scope["state"]）
-        account_id = ""
+        _inc_active()
         try:
-            state = scope.get("state", {})
-            acc = state.get("account")
-            if acc and isinstance(acc, dict):
-                account_id = acc.get("email") or acc.get("mobile") or ""
-        except Exception:
-            pass
+            # 1) 从 ASGI receive 完整读取请求体
+            body_chunks = []
+            more_body = True
+            while more_body:
+                msg = await receive()
+                body = msg.get("body", b"")
+                if body:
+                    body_chunks.append(body)
+                more_body = msg.get("more_body", False)
+            body_bytes = b"".join(body_chunks)
 
-        # 7) 从响应体中解析 token 用量
-        completion = 0
-        total = prompt_est
-        if response_body:
-            body_text = bytes(response_body).decode("utf-8", errors="replace")
+            # 2) 解析请求参数
+            start_ts = time.time()
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            model = "unknown"
+            stream = False
+            thinking = True
+            prompt_est = 0
 
-            if stream:
-                # SSE 流式：逐行查找包含 "usage" 的 data: 行
-                for line in body_text.split("\n"):
-                    line = line.strip()
-                    if line.startswith("data:") and '"usage"' in line:
-                        try:
-                            data_str = line[5:].strip()
-                            if data_str == "[DONE]":
-                                continue
-                            chunk = json.loads(data_str)
-                            usage = chunk.get("usage", {})
-                            if usage:
-                                prompt_est = usage.get("prompt_tokens", prompt_est)
-                                completion = usage.get("completion_tokens", 0)
-                                total = usage.get("total_tokens", prompt_est + completion)
-                        except Exception:
-                            pass
-            else:
-                # 非流式：直接解析 JSON
+            if body_bytes:
                 try:
-                    resp_data = json.loads(body_text)
-                    usage = resp_data.get("usage", {})
-                    if usage:
-                        prompt_est = usage.get("prompt_tokens", prompt_est)
-                        completion = usage.get("completion_tokens", 0)
-                        total = usage.get("total_tokens", prompt_est + completion)
+                    data = json.loads(body_bytes)
+                    model = data.get("model", "unknown")
+                    stream = bool(data.get("stream", False))
+
+                    t_obj = data.get("thinking")
+                    if isinstance(t_obj, dict):
+                        thinking = t_obj.get("type") == "enabled"
+                    elif isinstance(t_obj, bool):
+                        thinking = t_obj
+                    else:
+                        thinking = data.get("thinking_enabled", True)
+
+                    msgs = data.get("messages", [])
+                    sys_ = data.get("system", "")
+                    prompt_est = len(sys_ + json.dumps(msgs, ensure_ascii=False)) // 4
                 except Exception:
                     pass
 
-        # 8) 写入统计
-        try:
-            record_usage(start_ts, date_str, scope["path"], model,
-                         account_id, "", stream, thinking,
-                         prompt_est, completion, total)
-        except Exception as e:
-            logger.error(f"[StatsASGIMiddleware] record_usage 异常: {e}")
+            # 3) 构造 wrapped_receive：首次返回缓存 body，后续透传（断连检测）
+            body_consumed = False
+
+            async def wrapped_receive():
+                nonlocal body_consumed
+                if not body_consumed:
+                    body_consumed = True
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                return await receive()
+
+            # 4) 始终拦截 response body 以提取 token（流式 SSE 也包含最后一条 usage 信息）
+            response_body = bytearray()
+
+            async def wrapped_send(message):
+                if message["type"] == "http.response.body":
+                    response_body.extend(message.get("body", b""))
+                await send(message)
+
+            # 5) 执行下游（始终使用 wrapped_send 捕获所有 body）
+            await self.app(scope, wrapped_receive, wrapped_send)
+
+            # 6) 提取账号（由 determine_mode_and_token 注入到 request.state，通过 scope["state"]）
+            account_id = ""
+            try:
+                state = scope.get("state", {})
+                acc = state.get("account")
+                if acc and isinstance(acc, dict):
+                    account_id = acc.get("email") or acc.get("mobile") or ""
+            except Exception:
+                pass
+
+            # 7) 从响应体中解析 token 用量
+            completion = 0
+            total = prompt_est
+            if response_body:
+                body_text = bytes(response_body).decode("utf-8", errors="replace")
+
+                if stream:
+                    # SSE 流式：逐行查找包含 "usage" 的 data: 行
+                    for line in body_text.split("\n"):
+                        line = line.strip()
+                        if line.startswith("data:") and '"usage"' in line:
+                            try:
+                                data_str = line[5:].strip()
+                                if data_str == "[DONE]":
+                                    continue
+                                chunk = json.loads(data_str)
+                                usage = chunk.get("usage", {})
+                                if usage:
+                                    prompt_est = usage.get("prompt_tokens", prompt_est)
+                                    completion = usage.get("completion_tokens", 0)
+                                    total = usage.get("total_tokens", prompt_est + completion)
+                            except Exception:
+                                pass
+                else:
+                    # 非流式：直接解析 JSON
+                    try:
+                        resp_data = json.loads(body_text)
+                        usage = resp_data.get("usage", {})
+                        if usage:
+                            prompt_est = usage.get("prompt_tokens", prompt_est)
+                            completion = usage.get("completion_tokens", 0)
+                            total = usage.get("total_tokens", prompt_est + completion)
+                    except Exception:
+                        pass
+
+            # 8) 写入统计
+            try:
+                record_usage(start_ts, date_str, scope["path"], model,
+                             account_id, "", stream, thinking,
+                             prompt_est, completion, total)
+            except Exception as e:
+                logger.error(f"[StatsASGIMiddleware] record_usage 异常: {e}")
+        finally:
+            _dec_active()
 
 
 # 将 ASGI 中间件添加到原始 app
@@ -460,6 +483,11 @@ async def stats_recent(limit: int = 20):
         return JSONResponse(rows)
     finally:
         conn.close()
+
+
+@app.get("/api/stats/active")
+async def stats_active():
+    return JSONResponse({"active_connections": _active_connections})
 
 
 # =============================================================================

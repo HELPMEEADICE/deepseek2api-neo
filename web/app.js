@@ -267,11 +267,30 @@ async function refreshAll() {
       updateCharts(),
       updateAccounts(),
       updateRecent(),
+      updateActive(),
     ]);
   } catch (e) {
     console.error('[refreshAll]', e);
   } finally {
     setTimeout(() => btn.classList.remove('spinning'), 400);
+  }
+}
+
+// ======== 活动连接 ========
+async function updateActive() {
+  try {
+    const data = await fetchJSON('/api/stats/active');
+    const count = data.active_connections || 0;
+    const chip = $('#activeChip');
+    const counter = $('#activeCount');
+    counter.textContent = count;
+    if (count > 0) {
+      chip.classList.add('has-connections');
+    } else {
+      chip.classList.remove('has-connections');
+    }
+  } catch (e) {
+    // ignore
   }
 }
 
@@ -289,12 +308,16 @@ $$('.segmented-btn').forEach(btn => {
 $('#refreshBtn').addEventListener('click', refreshAll);
 
 let autoRefreshTimer = null;
+let activePollTimer = null;
+
 function startAutoRefresh() {
   stopAutoRefresh();
   autoRefreshTimer = setInterval(refreshAll, 60000);
+  activePollTimer = setInterval(updateActive, 2000);
 }
 function stopAutoRefresh() {
   if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  if (activePollTimer) clearInterval(activePollTimer);
 }
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) stopAutoRefresh();
