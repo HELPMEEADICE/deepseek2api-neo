@@ -160,11 +160,18 @@ def _extract_stream_arguments(text: str) -> str:
 
 TOOL_ARGUMENT_STREAM_CHUNK_SIZE = 24
 TOOL_ARGUMENT_STREAM_DELAY = 0.015
+TOOL_MARKER_LOOKBEHIND = 64
 
 
 def _iter_text_chunks(text: str, size: int = TOOL_ARGUMENT_STREAM_CHUNK_SIZE):
     for start in range(0, len(text), size):
         yield text[start:start + size]
+
+
+def _split_safe_text_for_tool_detection(text: str, force: bool = False):
+    if force or len(text) <= TOOL_MARKER_LOOKBEHIND:
+        return (text, "") if force else ("", text)
+    return text[:-TOOL_MARKER_LOOKBEHIND], text[-TOOL_MARKER_LOOKBEHIND:]
 
 
 # ----------------------------------------------------------------------
@@ -398,6 +405,7 @@ After calling tools, you will receive the results and can continue the conversat
                     tool_stream_id = "call_001"
                     tool_stream_name = ""
                     tool_stream_buffer = ""
+                    pending_tool_scan_text = ""
                     result_queue = queue.Queue()
                     last_send_time = time.time()
 
@@ -607,8 +615,11 @@ After calling tools, you will receive the results and can continue the conversat
                                     # Do not leak the raw JSON instruction payload as assistant text.
                                     final_text = final_text_content
 
-                                if has_tools and final_text and not tool_calls_detected:
-                                    text_delta = {"content": final_text}
+                                if pending_tool_scan_text and not tool_calls_detected:
+                                    safe_text, pending_tool_scan_text = _split_safe_text_for_tool_detection(
+                                        pending_tool_scan_text, force=True
+                                    )
+                                    text_delta = {"content": safe_text}
                                     if not first_chunk_sent:
                                         text_delta["role"] = "assistant"
                                         first_chunk_sent = True
@@ -739,14 +750,39 @@ After calling tools, you will receive the results and can continue the conversat
                                 elif ctype == "text":
                                     final_text += ctext
 
-                                if ctype == "text" and not tool_call_buffering:
+                                if ctype == "text" and has_tools and not tool_call_buffering:
                                     tool_buffer_started_now = False
-                                    stripped_text = chat.strip_partial_tool_call_text(final_text)
-                                    if stripped_text != final_text:
+                                    pending_tool_scan_text += ctext
+                                    stripped_text = chat.strip_partial_tool_call_text(pending_tool_scan_text)
+                                    if stripped_text != pending_tool_scan_text:
                                         tool_call_buffering = True
                                         tool_buffer_started_now = True
-                                        tool_stream_buffer = final_text[len(stripped_text):]
-                                        final_text = stripped_text
+                                        safe_text = stripped_text
+                                        if safe_text:
+                                            delta_obj = {"content": safe_text}
+                                            if not first_chunk_sent:
+                                                delta_obj["role"] = "assistant"
+                                                first_chunk_sent = True
+                                            new_choices.append({
+                                                "delta": delta_obj,
+                                                "index": choice.get("index", 0),
+                                            })
+                                        tool_stream_buffer = pending_tool_scan_text[len(stripped_text):]
+                                        final_text = final_text[:len(final_text) - len(pending_tool_scan_text)] + stripped_text
+                                        pending_tool_scan_text = ""
+                                    else:
+                                        safe_text, pending_tool_scan_text = _split_safe_text_for_tool_detection(
+                                            pending_tool_scan_text
+                                        )
+                                        if safe_text:
+                                            delta_obj = {"content": safe_text}
+                                            if not first_chunk_sent:
+                                                delta_obj["role"] = "assistant"
+                                                first_chunk_sent = True
+                                            new_choices.append({
+                                                "delta": delta_obj,
+                                                "index": choice.get("index", 0),
+                                            })
                                 else:
                                     tool_buffer_started_now = False
 
@@ -774,8 +810,8 @@ After calling tools, you will receive the results and can continue the conversat
                                             if arg_part:
                                                 yield from _stream_tool_arguments(arg_part)
 
-                                # When tools are enabled (or a tool-call marker appears), buffer
-                                # text until completion so raw tool-call markup is not shown.
+                                # Tool-enabled text is emitted above after a small lookbehind so
+                                # partial tool-call markers do not leak to the client.
                                 if ctype == "text" and (has_tools or tool_call_buffering):
                                     continue
 
@@ -1247,6 +1283,7 @@ After calling tools, you will receive the results and can continue the conversat
                     all_thinking = ""
                     all_text = ""
                     visible_text = ""
+                    pending_tool_scan_text = ""
                     tool_call_buffering = False
                     tool_stream_buffer = ""
                     tool_stream_id = "call_001"
@@ -1383,20 +1420,19 @@ After calling tools, you will receive the results and can continue the conversat
                                 text_part = delta.get("text")
                                 if text_part is not None:
                                     tool_buffer_started_now = False
+                                    if not has_tools:
+                                        yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
+                                        last_send_time = current_time
+                                        continue
+
                                     if tool_call_buffering:
                                         if text_part:
                                             tool_stream_buffer += text_part
                                     else:
-                                        visible_text += text_part
-                                        stripped_text = chat.strip_partial_tool_call_text(visible_text)
-                                        if stripped_text == visible_text:
-                                            yield f"event: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
-                                            last_send_time = current_time
-                                            continue
-
-                                        previous_visible_len = len(visible_text) - len(text_part)
-                                        if len(stripped_text) > previous_visible_len:
-                                            safe_part = stripped_text[previous_visible_len:]
+                                        pending_tool_scan_text += text_part
+                                        stripped_text = chat.strip_partial_tool_call_text(pending_tool_scan_text)
+                                        if stripped_text != pending_tool_scan_text:
+                                            safe_part = stripped_text
                                             if safe_part:
                                                 safe_item = {
                                                     "event": "content_block_delta",
@@ -1407,11 +1443,27 @@ After calling tools, you will receive the results and can continue the conversat
                                                 }
                                                 yield f"event: {safe_item['event']}\ndata: {json.dumps(safe_item['data'], ensure_ascii=False)}\n\n"
                                                 last_send_time = current_time
-
-                                        tool_call_buffering = True
-                                        tool_buffer_started_now = True
-                                        tool_stream_buffer = visible_text[len(stripped_text):]
-                                        visible_text = stripped_text
+                                            visible_text += stripped_text
+                                            tool_call_buffering = True
+                                            tool_buffer_started_now = True
+                                            tool_stream_buffer = pending_tool_scan_text[len(stripped_text):]
+                                            pending_tool_scan_text = ""
+                                        else:
+                                            safe_part, pending_tool_scan_text = _split_safe_text_for_tool_detection(
+                                                pending_tool_scan_text
+                                            )
+                                            if safe_part:
+                                                visible_text += safe_part
+                                                safe_item = {
+                                                    "event": "content_block_delta",
+                                                    "data": {
+                                                        **item["data"],
+                                                        "delta": {**delta, "text": safe_part},
+                                                    },
+                                                }
+                                                yield f"event: {safe_item['event']}\ndata: {json.dumps(safe_item['data'], ensure_ascii=False)}\n\n"
+                                                last_send_time = current_time
+                                            continue
 
                                     if not tool_call_buffering:
                                         continue
@@ -1483,6 +1535,35 @@ After calling tools, you will receive the results and can continue the conversat
                         if tool_stream_started and tool_stream_index is not None:
                             stop_ev = _make_tool_stop(tool_stream_index)
                             yield f"event: {stop_ev['event']}\ndata: {json.dumps(stop_ev['data'], ensure_ascii=False)}\n\n"
+
+                        if pending_tool_scan_text and not tool_calls_detected:
+                            safe_part, pending_tool_scan_text = _split_safe_text_for_tool_detection(
+                                pending_tool_scan_text, force=True
+                            )
+                            if safe_part:
+                                if not sse_state["block_active"]:
+                                    text_index = sse_state.get("next_block_index", 0)
+                                    sse_state["next_block_index"] = text_index + 1
+                                    sse_state["active_block_index"] = text_index
+                                    sse_state["block_active"] = True
+                                    text_start = {
+                                        "event": "content_block_start",
+                                        "data": {
+                                            "type": "content_block_start",
+                                            "index": text_index,
+                                            "content_block": {"type": "text", "text": ""},
+                                        },
+                                    }
+                                    yield f"event: {text_start['event']}\ndata: {json.dumps(text_start['data'], ensure_ascii=False)}\n\n"
+                                text_delta = {
+                                    "event": "content_block_delta",
+                                    "data": {
+                                        "type": "content_block_delta",
+                                        "index": sse_state.get("active_block_index", 0),
+                                        "delta": {"type": "text_delta", "text": safe_part},
+                                    },
+                                }
+                                yield f"event: {text_delta['event']}\ndata: {json.dumps(text_delta['data'], ensure_ascii=False)}\n\n"
 
                         # 如果未能提前流式识别，则兼容地在结束时拆分补发。
                         if tool_calls_detected and not tool_stream_started:
