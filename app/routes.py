@@ -436,13 +436,12 @@ After calling tools, you will receive the results and can continue the conversat
                                     if flush and not detector.has_tool_start():
                                         yield _emit_delta({"content": flush})
 
-                                    # 2) 解析工具调用
+                                    # 2) 解析工具调用（处理流式发送后的残余）
                                     tool_calls_detected = None
                                     if detector.has_tool_start() and detector.collected:
                                         parsed, _ = chat.detect_and_parse_tool_calls(detector.collected)
                                         if parsed:
                                             tool_calls_detected = parsed
-                                        # 如果解析失败，说明是误判，将 collected 内容当作普通文本输出
                                         if not tool_calls_detected:
                                             yield _emit_delta({"content": detector.collected})
                                     else:
@@ -451,7 +450,18 @@ After calling tools, you will receive the results and can continue the conversat
                                             tool_calls_detected = parsed
                                             final_text = remaining
 
-                                    if tool_calls_detected:
+                                    # 对已流式发送的 tool call 只发剩余参数 + finish
+                                    if tool_calls_detected and detector.meta_sent:
+                                        # 已流式发送了 start chunk，只发剩余参数
+                                        func = tool_calls_detected[0].get("function", {})
+                                        remaining_args = func.get("arguments", "{}")
+                                        # 最终补全参数（确保最后一个参数 chunk 被发出）
+                                        arg_delta = detector.get_arguments_delta()
+                                        if arg_delta:
+                                            yield _emit_delta({
+                                                "tool_calls": [{"index": 0, "function": {"arguments": arg_delta}}]
+                                            })
+                                    elif tool_calls_detected:
                                         yield from _stream_tool_call_events(tool_calls_detected)
 
                                     usage = {
@@ -485,8 +495,44 @@ After calling tools, you will receive the results and can continue the conversat
                                         safe = detector.feed(ctext)
                                         if safe:
                                             yield _emit_delta({"content": safe})
+                                        # 检测到进入 collecting → 发送 tool_calls start chunk
+                                        if detector.state == "collecting" and not detector.meta_sent:
+                                            name, call_id = detector.get_tool_meta()
+                                            if name:
+                                                detector.mark_meta_sent()
+                                                yield _emit_delta({
+                                                    "tool_calls": [{
+                                                        "index": 0,
+                                                        "id": call_id,
+                                                        "type": "function",
+                                                        "function": {"name": name, "arguments": ""},
+                                                    }]
+                                                })
                                     elif detector.state == "collecting":
+                                        # 继续收集并流式发送参数增量
                                         detector.feed(ctext)
+                                        # 首次进入 collecting → 发送 start
+                                        if not detector.meta_sent:
+                                            name, call_id = detector.get_tool_meta()
+                                            if name:
+                                                detector.mark_meta_sent()
+                                                yield _emit_delta({
+                                                    "tool_calls": [{
+                                                        "index": 0,
+                                                        "id": call_id,
+                                                        "type": "function",
+                                                        "function": {"name": name, "arguments": ""},
+                                                    }]
+                                                })
+                                        # 流式发送参数增量
+                                        arg_delta = detector.get_arguments_delta()
+                                        if arg_delta:
+                                            yield _emit_delta({
+                                                "tool_calls": [{
+                                                    "index": 0,
+                                                    "function": {"arguments": arg_delta},
+                                                }]
+                                            })
                                     else:
                                         yield _emit_delta({"content": ctext})
 
@@ -1056,9 +1102,55 @@ After calling tools, you will receive the results and can continue the conversat
                                                 "event": "content_block_delta",
                                                 "data": {**item["data"], "delta": {"type": "text_delta", "text": safe}},
                                             })
+                                        # 检测到进入 collecting → 关闭 text block 并发送 tool_use start
+                                        if detector.state == "collecting" and not detector.meta_sent:
+                                            name, call_id = detector.get_tool_meta()
+                                            if name:
+                                                detector.mark_meta_sent()
+                                                if sse_state["block_active"]:
+                                                    yield _emit_anthro({
+                                                        "event": "content_block_stop",
+                                                        "data": {"type": "content_block_stop", "index": sse_state.get("active_block_index", 0)},
+                                                    })
+                                                    sse_state["block_active"] = False
+                                                ti = sse_state.get("next_block_index", 0)
+                                                sse_state["next_block_index"] = ti + 1
+                                                yield _emit_anthro({
+                                                    "event": "content_block_start",
+                                                    "data": {"type": "content_block_start", "index": ti, "content_block": {
+                                                        "type": "tool_use", "id": call_id, "name": name, "input": {},
+                                                    }},
+                                                })
                                         continue
                                     elif detector.state == "collecting":
                                         detector.feed(text_part)
+                                        # 首次进入 collecting → 发送 tool_use start
+                                        if not detector.meta_sent:
+                                            name, call_id = detector.get_tool_meta()
+                                            if name:
+                                                detector.mark_meta_sent()
+                                                if sse_state["block_active"]:
+                                                    yield _emit_anthro({
+                                                        "event": "content_block_stop",
+                                                        "data": {"type": "content_block_stop", "index": sse_state.get("active_block_index", 0)},
+                                                    })
+                                                    sse_state["block_active"] = False
+                                                ti = sse_state.get("next_block_index", 0)
+                                                sse_state["next_block_index"] = ti + 1
+                                                yield _emit_anthro({
+                                                    "event": "content_block_start",
+                                                    "data": {"type": "content_block_start", "index": ti, "content_block": {
+                                                        "type": "tool_use", "id": call_id, "name": name, "input": {},
+                                                    }},
+                                                })
+                                        # 流式发送 input_json_delta
+                                        arg_delta = detector.get_arguments_delta()
+                                        if arg_delta:
+                                            yield _emit_anthro({
+                                                "event": "content_block_delta",
+                                                "data": {"type": "content_block_delta", "index": sse_state.get("next_block_index", 1) - 1,
+                                                         "delta": {"type": "input_json_delta", "partial_json": arg_delta}},
+                                            })
                                         continue
 
                                 elif item["event"] == "content_block_start":
@@ -1067,8 +1159,6 @@ After calling tools, you will receive the results and can continue the conversat
                                         continue
                                 elif item["event"] == "content_block_stop" and detector.state == "collecting":
                                     continue
-
-                                yield _emit_anthro(item)
 
                             if item is None or item == "__FINISHED__":
                                 break  # 退出外层 while True
@@ -1094,8 +1184,23 @@ After calling tools, you will receive the results and can continue the conversat
                             parsed, _ = chat.detect_and_parse_tool_calls(detector.collected)
                             if parsed:
                                 tool_calls_detected = parsed
+                                # 如果已经流式发送了 start，只需要发剩余参数 + stop
+                                if detector.meta_sent:
+                                    arg_delta = detector.get_arguments_delta()
+                                    if arg_delta:
+                                        yield _emit_anthro({
+                                            "event": "content_block_delta",
+                                            "data": {"type": "content_block_delta",
+                                                     "index": sse_state.get("next_block_index", 1) - 1,
+                                                     "delta": {"type": "input_json_delta", "partial_json": arg_delta}},
+                                        })
+                                    yield _emit_anthro({
+                                        "event": "content_block_stop",
+                                        "data": {"type": "content_block_stop",
+                                                 "index": sse_state.get("next_block_index", 1) - 1},
+                                    })
+                                    tool_calls_detected = None  # 避免下面再发一次
                             else:
-                                # 误判：将 collected 当作普通文本输出
                                 if not sse_state["block_active"]:
                                     bi = sse_state["next_block_index"]
                                     sse_state["next_block_index"] = bi + 1
@@ -1114,7 +1219,7 @@ After calling tools, you will receive the results and can continue the conversat
                             if parsed:
                                 tool_calls_detected = parsed
 
-                        # 发送 tool_use blocks
+                        # 发送 tool_use blocks（未流式发送过的情况）
                         if tool_calls_detected:
                             if sse_state["block_active"]:
                                 yield _emit_anthro({

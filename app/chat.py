@@ -126,7 +126,7 @@ SLIDING_WINDOW_SIZE = 24
 
 
 class ToolCallStreamDetector:
-    """流式工具调用检测器 —— 滑动窗口 + 包围栏检测。
+    """流式工具调用检测器 —— 滑动窗口 + 围栏检测 + 流式参数提取。
 
     用法:
         detector = ToolCallStreamDetector()
@@ -134,19 +134,24 @@ class ToolCallStreamDetector:
             safe_text = detector.feed(text_chunk)
             if safe_text:
                 yield safe_text   # 安全文本，发送给客户端
+
             if detector.state == "collecting":
-                # 正在收集工具调用，缓冲 complete 后解析
-                ...
-        if detector.state in ("collecting", "done"):
-            raw_xml = detector.collected
-            tool_calls = detect_and_parse_tool_calls(raw_xml)
+                # 流式提取参数
+                meta = detector.get_tool_meta()   # (id, name) 或 (None, None)
+                delta = detector.get_arguments_delta()   # 增量参数
+                if meta and not meta_sent:
+                    emit start chunk
+                if delta:
+                    emit argument delta
     """
 
     def __init__(self):
         self.state = "detecting"  # detecting | collecting | done
         self._buffer = ""  # 滑动窗口
-        self.collected = ""  # 收集阶段的完整 XML
+        self.collected = ""  # 收集阶段的完整 XML / JSON
         self._fence_buffer = ""  # 用于跟踪 ``` 包围
+        self._last_arg_sent = 0  # 流式参数跟踪
+        self._meta_sent = False  # name/id 是否已流式发送
 
     def feed(self, text: str) -> str:
         """喂入新文本，返回应安全输出的文本（不含工具调用标记）。"""
@@ -155,7 +160,6 @@ class ToolCallStreamDetector:
 
         if self.state == "collecting":
             self.collected += text
-            # 检查收束标签
             idx = self.collected.rfind(TOOL_TAG_END)
             if idx >= 0:
                 after = self.collected[idx + len(TOOL_TAG_END):]
@@ -168,30 +172,24 @@ class ToolCallStreamDetector:
 
         # state == detecting: 滑动窗口扫描
         self._buffer += text
-
-        # 更新包围栏计数
         self._fence_buffer += text
-
-        # 扫描标记
         tag_idx = self._find_tool_tag()
 
         if tag_idx >= 0:
-            # 检查是否在包围栏内
             if self._is_inside_fence(tag_idx):
-                # 在包围栏内，清空 buffer 到 tag 之后
                 safe = self._buffer[:tag_idx + len(TOOL_TAG_START)]
                 self._buffer = ""
                 self._fence_buffer = ""
                 return safe
 
-            # 发现工具调用标记
             safe = self._buffer[:tag_idx]
             rest = self._buffer[tag_idx:]
             self.collected = rest
             self.state = "collecting"
             self._buffer = ""
+            self._last_arg_sent = 0
+            self._meta_sent = False
 
-            # 检查是否同一 chunk 内就包含了收束标签
             end_idx = self.collected.find(TOOL_TAG_END)
             if end_idx >= 0:
                 self.state = "done"
@@ -200,20 +198,15 @@ class ToolCallStreamDetector:
                 if after:
                     return safe + after
                 return safe
-
             return safe
 
-        # 未找到完整标记，释放安全文本
-        # 如果缓冲区末尾是标记的前缀 → 保留前缀部分，释放之前的内容
         partial_prefix_idx = self._check_partial_tag_prefix()
         if partial_prefix_idx > 0:
-            # 有部分前缀匹配：释放在前缀之前的文本
             safe = self._buffer[:partial_prefix_idx]
             self._buffer = self._buffer[partial_prefix_idx:]
             self._fence_buffer = self._fence_buffer[-SLIDING_WINDOW_SIZE * 4:]
             return safe
 
-        # 没有前缀匹配：按滑动窗口释放
         if len(self._buffer) > SLIDING_WINDOW_SIZE:
             release_len = len(self._buffer) - SLIDING_WINDOW_SIZE
             safe = self._buffer[:release_len]
@@ -224,16 +217,103 @@ class ToolCallStreamDetector:
 
         return ""
 
+    # ---------- 流式参数提取 ----------
+
+    def get_tool_meta(self):
+        """从 collected 中提取工具名和 ID。返回 (name, call_id) 或 (None, None)。"""
+        if self.state not in ("collecting", "done"):
+            return None, None
+
+        text = self.collected
+        call_id = None
+        name = None
+
+        # 尝试从 XML <tool_call name="..."> 提取
+        xml_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', text, re.I)
+        if xml_match:
+            name = _normalize_tool_name(xml_match.group(1))
+
+        # 尝试从 JSON {"id":"...","function":{"name":"..."}} 提取
+        id_match = re.search(r'"id"\s*:\s*"([^"]+)"', text)
+        if id_match:
+            call_id = id_match.group(1)
+
+        name_match_json = re.search(r'"name"\s*:\s*"([^"]+)"', text)
+        if name_match_json and not name:
+            name = _normalize_tool_name(name_match_json.group(1))
+
+        # 补全默认 id
+        if not call_id:
+            call_id = "call_001"
+
+        return name, call_id
+
+    def get_stream_arguments(self) -> str:
+        """从 collected 中提取当前的 arguments 字符串（用于流式输出）。"""
+        if self.state not in ("collecting", "done"):
+            return ""
+
+        text = self.collected
+
+        # 尝试 JSON 格式的 arguments
+        match = re.search(r'"arguments"\s*:\s*', text)
+        if match:
+            raw = text[match.end():]
+            stripped = raw.lstrip()
+            if stripped.startswith('"'):
+                # arguments 是 JSON 字符串：提取到闭合引号
+                return _decode_json_string_prefix(stripped[1:])
+            else:
+                # arguments 是 JSON 对象：提取到平衡括号
+                return _balanced_json_prefix(stripped)
+
+        # 尝试 XML 格式 <tool_call name="...">...arguments...</tool_call>
+        xml_match = re.search(r'<tool_call\s+name=["\'][^"\']+["\']\s*>', text, re.I)
+        if xml_match:
+            body = text[xml_match.end():]
+            end = body.rfind(TOOL_TAG_END)
+            if end >= 0:
+                body = body[:end]
+            return body.strip()
+
+        # 尝试不带引号的 name 属性
+        loose_match = re.search(r'<tool_call\s+name=([^\s>]+)\s*>', text, re.I)
+        if loose_match:
+            body = text[loose_match.end():]
+            end = body.rfind(TOOL_TAG_END)
+            if end >= 0:
+                body = body[:end]
+            return body.strip()
+
+        return ""
+
+    def get_arguments_delta(self) -> str:
+        """返回自上次调用以来新增的 arguments 字符串（增量）。"""
+        current = self.get_stream_arguments()
+        if len(current) > self._last_arg_sent:
+            delta = current[self._last_arg_sent:]
+            self._last_arg_sent = len(current)
+            return delta
+        return ""
+
+    def mark_meta_sent(self):
+        """标记 name/id 已经流式发送，避免重复发送 start chunk。"""
+        self._meta_sent = True
+
+    @property
+    def meta_sent(self) -> bool:
+        return self._meta_sent
+
+    # ---------- 原有的辅助方法 ----------
+
     def _find_tool_tag(self) -> int:
-        """在缓冲区中查找工具调用标记，返回索引或 -1。"""
+        """在缓冲区中查找工具调用标记。"""
         buf_lower = self._buffer.lower()
-        # 优先匹配 XML 标记（最可靠）
+        # XML 标记：<tool_call — 自然以 < 开头，前面不可能是合法单词的一部分
         idx = buf_lower.find(TOOL_TAG_START.lower())
         if idx >= 0:
-            # 检查 <tool_call 前面不能是字母（避免匹配到 xmltag<tool_call）
-            if idx == 0 or not buf_lower[idx - 1].isalpha():
-                return idx
-        # JSON 标记：要求标记的 { 或 [ 前不能是字母（避免 false positive）
+            return idx
+        # JSON 标记：检查 { 或 [ 前不能是字母（避免 false positive 如 word{"tool_calls"|）
         for marker in TOOL_JSON_MARKERS:
             idx = buf_lower.find(marker.lower())
             if idx >= 0:
@@ -242,9 +322,7 @@ class ToolCallStreamDetector:
         return -1
 
     def _check_partial_tag_prefix(self) -> int:
-        """检查缓冲区末尾是否可能是标记的前缀（用于防止跨 chunk 拆分）。"""
         buf_lower = self._buffer.lower()
-        # 检查所有标记的前缀
         all_markers = [TOOL_TAG_START] + TOOL_JSON_MARKERS
         for marker in all_markers:
             marker_lower = marker.lower()
@@ -254,14 +332,11 @@ class ToolCallStreamDetector:
         return -1
 
     def _is_inside_fence(self, tag_idx: int) -> bool:
-        """检查 tag 位置之前的文本是否在未闭合的代码围栏内。"""
-        # 只计数 tag 位置之前的 ``` 
         prefix = self._fence_buffer[:tag_idx] if tag_idx < len(self._fence_buffer) else self._fence_buffer
         fence_count = prefix.count("```")
         return fence_count % 2 == 1
 
     def force_flush(self) -> str:
-        """强制输出检测状态下的缓冲文本（保留 collecting 内容供后续解析）。"""
         if self.state == "detecting" and self._buffer:
             result = self._buffer
             self._buffer = ""
@@ -276,6 +351,76 @@ class ToolCallStreamDetector:
         self._buffer = ""
         self.collected = ""
         self._fence_buffer = ""
+        self._last_arg_sent = 0
+        self._meta_sent = False
+
+
+# 导出的提取函数（供 detector 和旧的 detect_and_parse 共用）
+def _decode_json_string_prefix(raw: str) -> str:
+    """解码 JSON 引号内的字符串前缀（包括转义处理）。"""
+    chars = []
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '"':
+            break
+        if ch == "\\":
+            if i + 1 >= len(raw):
+                break
+            nxt = raw[i + 1]
+            mapping = {'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
+            if nxt == 'u' and i + 6 <= len(raw):
+                try:
+                    chars.append(chr(int(raw[i + 2:i + 6], 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    chars.append(nxt)
+            else:
+                chars.append(mapping.get(nxt, nxt))
+            i += 2
+            continue
+        chars.append(ch)
+        i += 1
+    return ''.join(chars)
+
+
+def _balanced_json_prefix(raw: str) -> str:
+    """提取从开头到首个平衡的 JSON 括号为止的前缀。"""
+    in_string = False
+    escape = False
+    stack = []
+    started = False
+    start = 0
+    for idx, ch in enumerate(raw):
+        if not started:
+            if ch.isspace():
+                continue
+            if ch not in '[{':
+                return ''
+            start = idx
+            stack = ['}' if ch == '{' else ']']
+            started = True
+            continue
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch in '[{':
+            stack.append('}' if ch == '{' else ']')
+        elif ch in '}]':
+            if not stack or ch != stack[-1]:
+                return ''
+            stack.pop()
+            if not stack:
+                return raw[start:idx + 1]
+    return ''
 
 
 # ----------------------------------------------------------------------
